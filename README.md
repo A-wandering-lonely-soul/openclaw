@@ -57,7 +57,7 @@ openclaw/
 5. 进入**权限管理**，开启以下权限：
    - `im:message`（接收和发送消息）
    - `im:message.group_at_msg`（接收群组 @ 消息）
-6. 进入**事件订阅** → 填写请求网址：`https://你的域名/feishu/webhook`
+6. 进入**事件订阅** → 填写请求网址：`https://lobsterpro.online/feishu/webhook`
    - 页面会发起验证请求，服务启动后即自动通过
 7. 在**事件订阅**页面添加事件：`im.message.receive_v1`（接收消息）
 8. 记录页面上的**验证 Token**（填入 `FEISHU_VERIFICATION_TOKEN`）
@@ -91,7 +91,7 @@ sudo usermod -aG docker $USER
 ### 3. 拉取项目代码
 
 ```bash
-git clone <你的仓库地址> ~/openclaw
+git clone https://github.com/A-wandering-lonely-soul/openclaw.git ~/openclaw
 cd ~/openclaw
 ```
 
@@ -102,11 +102,12 @@ cd ~/openclaw
 在项目根目录创建 `.env` 文件（**使用 printf 避免 Windows 换行符问题**）：
 
 ```bash
-printf "GITHUB_TOKEN=github_pat_你的token\nTELEGRAM_BOT_TOKEN=你的BotToken\nDEEPSEEK_API_KEY=\nTAVILY_API_KEY=tvly-你的key\n" > ~/openclaw/.env
+printf "DOMAIN=你的域名\nGITHUB_TOKEN=github_pat_你的token\nTELEGRAM_BOT_TOKEN=你的BotToken\nDEEPSEEK_API_KEY=\nTAVILY_API_KEY=tvly-你的key\n" > ~/openclaw/.env
 ```
 
 `.env` 文件内容示例：
 ```
+DOMAIN=lobsterpro.online
 GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxx
 TELEGRAM_BOT_TOKEN=1234567890:AAGxxxxxxxxxxxxxx
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx          # 可选，飞书接入
@@ -247,7 +248,7 @@ docker-compose up -d
 docker ps
 
 # 验证当前模型
-curl http://localhost:8000/api/get_model
+curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 ```
 
 ---
@@ -277,7 +278,7 @@ curl http://localhost:8000/api/get_model
 **Q: 飞书事件订阅填写请求网址后验证失败**
 - 确保服务已通过 `docker-compose up -d` 启动
 - 确认 Caddyfile 中的域名与实际域名一致，且 HTTPS 证书已签发
-- 可用 `curl https://你的域名/feishu/webhook` 测试端口连通性
+- 可用 `curl https://lobsterpro.online/feishu/webhook` 测试端口连通性
 
 **Q: 飞书机器人收到消息但不回复**
 - 运行 `docker logs -f feishu_bot` 查看错误

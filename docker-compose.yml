@@ -10,8 +10,6 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1}
     restart: always
-    ports:
-      - "8000:8000"
     networks:
       - claw_net
 
@@ -23,6 +21,25 @@ services:
       - OPENCLAW_URL=http://openclaw:8000
     depends_on:
       - openclaw
+    restart: always
+    networks:
+      - claw_net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - DOMAIN=${DOMAIN}
+    depends_on:
+      - openclaw
+      - feishu_bot
     restart: always
     networks:
       - claw_net
@@ -41,6 +58,10 @@ services:
     restart: always
     networks:
       - claw_net
+
+volumes:
+  caddy_data:
+  caddy_config:
 
 networks:
   claw_net:
