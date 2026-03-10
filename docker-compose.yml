@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  openclaw:
+    build: .
+    container_name: openclaw_service
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1}
+    restart: always
+    ports:
+      - "8000:8000"
+    networks:
+      - claw_net
+
+  telegram_bot:
+    build: ./telegram_bot
+    container_name: telegram_bot
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - OPENCLAW_URL=http://openclaw:8000
+    depends_on:
+      - openclaw
+    restart: always
+    networks:
+      - claw_net
+
+  feishu_bot:
+    build: ./feishu_bot
+    container_name: feishu_bot
+    environment:
+      - FEISHU_APP_ID=${FEISHU_APP_ID}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+      - FEISHU_VERIFICATION_TOKEN=${FEISHU_VERIFICATION_TOKEN:-}
+      - FEISHU_ENCRYPT_KEY=${FEISHU_ENCRYPT_KEY:-}
+      - OPENCLAW_URL=http://openclaw:8000
+    depends_on:
+      - openclaw
+    restart: always
+    networks:
+      - claw_net
+
+networks:
+  claw_net:

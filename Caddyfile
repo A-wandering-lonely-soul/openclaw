@@ -1,0 +1,9 @@
+openclaw.example.com {
+    # 飞书 Webhook 路径转发给 feishu_bot 服务
+    handle /feishu/* {
+        reverse_proxy feishu_bot:8002
+    }
+
+    # 其余请求转发给 openclaw 主服务
+    reverse_proxy openclaw:8000
+}
