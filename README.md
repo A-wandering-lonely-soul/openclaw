@@ -109,6 +109,8 @@ cd ~/openclaw
 
 ```bash
 cd ~/openclaw
+# 如果脚本在 Windows 上编辑过，先去除 Windows 换行符（\r）
+sed -i 's/\r//' deploy.sh openclaw-box.sh
 chmod +x deploy.sh
 ./deploy.sh
 ```
@@ -330,6 +332,14 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 **Q: 联网搜索没有触发**
 - 检查 `TAVILY_API_KEY` 是否已填入 `.env` 并重新部署（`build --no-cache`）
 - 消息里需含有触发关键词（最新、今天、天气、新闻等）
+
+**Q: 运行 `openclaw-box` 报错 `Permission denied`**
+- 软链接目标文件没有执行权限，运行以下命令授权：
+- `sudo chmod +x /usr/local/bin/openclaw-box`
+
+**Q: 运行 deploy.sh 报错 `/usr/bin/env: 'bash\r': No such file or directory`**
+- 脚本包含 Windows 换行符（CRLF），在 Linux 上无法执行
+- 修复命令：`sed -i 's/\r//' ~/openclaw/deploy.sh ~/openclaw/openclaw-box.sh`
 
 **Q: .env 修改后不生效**
 - 可以直接重新运行 `./deploy.sh`，或手动执行 `docker compose up -d`

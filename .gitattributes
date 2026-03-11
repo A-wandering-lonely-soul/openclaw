@@ -1,0 +1,7 @@
+# 统一换行符：所有文本文件在仓库中存储为 LF
+* text=auto
+
+# Shell 脚本强制 LF，防止在 Windows 上编辑后变成 CRLF 导致 Linux 无法执行
+*.sh text eol=lf
+Caddyfile text eol=lf
+Caddyfile.nginx text eol=lf
