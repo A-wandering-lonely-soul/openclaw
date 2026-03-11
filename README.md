@@ -26,8 +26,14 @@ openclaw/
 │   └── Dockerfile
 ├── Dockerfile            # openclaw 服务镜像
 ├── docker-compose.yml
-├── Caddyfile             # 反向代理配置
+├── docker-compose.nginx.yml
+├── Caddyfile             # 独占 80/443 时使用的反向代理配置
+├── Caddyfile.nginx       # 已有 nginx 时使用的 Caddy 配置
+├── nginx/
+│   └── openclaw.conf.example
 ├── openclaw-box.sh       # 服务器管理面板脚本
+├── deploy.sh             # 一键部署脚本
+├── .env.example          # 环境变量模板
 └── .env                  # 密钥配置（不提交到 git）
 ```
 
@@ -97,52 +103,99 @@ cd ~/openclaw
 
 ---
 
-### 4. 配置密钥
+### 4. 一键部署
 
-在项目根目录创建 `.env` 文件（**使用 printf 避免 Windows 换行符问题**）：
+推荐直接运行一键脚本：
 
 ```bash
-printf "DOMAIN=你的域名\nGITHUB_TOKEN=github_pat_你的token\nTELEGRAM_BOT_TOKEN=你的BotToken\nDEEPSEEK_API_KEY=\nTAVILY_API_KEY=tvly-你的key\n" > ~/openclaw/.env
+cd ~/openclaw
+chmod +x deploy.sh
+./deploy.sh
 ```
 
-`.env` 文件内容示例：
-```
-DOMAIN=lobsterpro.online
-GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxx
-TELEGRAM_BOT_TOKEN=1234567890:AAGxxxxxxxxxxxxxx
-FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx          # 可选，飞书接入
-FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx          # 可选，飞书接入
-FEISHU_VERIFICATION_TOKEN=xxxxxxxxxxxxxxxx  # 可选，飞书事件验证
-FEISHU_ENCRYPT_KEY=                         # 可选，飞书消息加密
-DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx        # 可选
-TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx        # 可选，联网搜索
-```
+脚本会自动完成这些事情：
+- 检测当前机器是否已有 nginx 或 80/443 是否被占用，并自动切换代理模式
+- 自动创建 `.env`，按你的选择逐项询问需要的变量
+- 只在你选择 Telegram 时询问 `TELEGRAM_BOT_TOKEN`
+- 只在你选择飞书时询问飞书相关变量
+- 只在你选择 DeepSeek 作为默认模型时询问 `DEEPSEEK_API_KEY`
+- 只在你启用联网搜索时询问 `TAVILY_API_KEY`
+- 只启动你选中的 Bot 服务，未选中的 Telegram/飞书容器不会启动
+
+脚本支持两种代理模式：
+
+**模式 A：Caddy 直接对外监听 80/443**
+- 适合服务器上没有其他 Web 服务的情况
+- 自动申请和续期 HTTPS 证书
+
+**模式 B：nginx 已经占用 80/443，OpenClaw 挂到现有 nginx 后面**
+- 适合已经在服务器上运行 nginx 的情况
+- 不需要停止 nginx
+- Caddy 只监听本机 `127.0.0.1:8080` 或脚本提示的其他空闲端口
+- 由 nginx 继续负责公网 80/443 和 TLS 证书
+
+`.env` 模板可参考 [.env.example](.env.example)。
 
 > ⚠️ `.env` 已加入 `.gitignore`，不会被提交到 git，请勿手动分享此文件内容。
 > ⚠️ 不要把 Token 粘贴到任何聊天窗口，包括和 AI 的对话。
 
----
+### 5. 手动部署（高级用法）
 
-### 5. 构建并启动服务
+如果你不想使用一键脚本，也可以手动创建 `.env` 后再执行 compose。
+
+**模式 A：Caddy 直接对外提供 HTTPS**
 
 ```bash
 cd ~/openclaw
-docker-compose build
-docker-compose up -d
+docker compose build
+docker compose up -d
 ```
 
-验证服务状态：
+**模式 B：保留 nginx，占用 80/443 的仍然是 nginx**
+
+```bash
+cd ~/openclaw
+docker compose -f docker-compose.yml -f docker-compose.nginx.yml build
+docker compose -f docker-compose.yml -f docker-compose.nginx.yml up -d
+```
+
+如果只启用 Telegram 或飞书，需要补上对应 profile：
+
+```bash
+# 只启用 Telegram
+docker compose --profile telegram up -d
+
+# 只启用飞书
+docker compose --profile feishu up -d
+
+# 同时启用 Telegram 和飞书
+docker compose --profile telegram --profile feishu up -d
+```
+
+### 6. nginx 前置模式配置
+
+如果你使用“模式 B”，把 [nginx/openclaw.conf.example](nginx/openclaw.conf.example) 放到 nginx 站点配置目录，替换其中域名和证书路径后启用。
+
+这个配置会把 nginx 收到的 HTTPS 请求转发到本机 `127.0.0.1:8080`，再由容器内 Caddy 按路径分发：
+- `/feishu/*` 转给 `feishu_bot`
+- 其余路径转给 `openclaw`
+
+典型启用步骤：
+
+```bash
+sudo cp ~/openclaw/nginx/openclaw.conf.example /etc/nginx/sites-available/openclaw.conf
+sudo ln -s /etc/nginx/sites-available/openclaw.conf /etc/nginx/sites-enabled/openclaw.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### 7. 验证服务状态
+
 ```bash
 docker ps
 ```
 
-两个容器均为 `Up` 状态即部署成功：
-```
-openclaw_service   Up   0.0.0.0:8000->8000/tcp
-telegram_bot       Up
-feishu_bot         Up
-```
-
+已启用的相关容器均为 `Up` 状态即部署成功。未选择的 Telegram 或飞书容器不会出现。
 ---
 
 ## 使用方式
@@ -202,11 +255,11 @@ openclaw-box
 | 选项 | 功能说明 |
 |------|----------|
 | 1 | 清空所有用户的 AI 对话历史，下次对话重新开始 |
-| 2 | 重启 openclaw_service 和 telegram_bot 容器 |
-| 3 | 停止所有服务 |
-| 4 | 启动所有服务 |
-| 5 | 查看两个容器最近 50 行日志 |
-| 6 | 清空两个容器的日志文件 |
+| 2 | 重启当前已部署的服务容器 |
+| 3 | 停止当前已部署的服务 |
+| 4 | 启动当前已部署的服务 |
+| 5 | 查看当前已部署容器最近 50 行日志 |
+| 6 | 清空当前已部署容器的日志文件 |
 | 7 | 切换 AI 模型（Copilot / DeepSeek），**切换后建议同时执行选项 1 清空上下文** |
 
 ### 可用模型
@@ -238,11 +291,19 @@ docker logs -f openclaw_service
 docker logs -f telegram_bot
 docker logs -f feishu_bot
 
+# 运行一键部署脚本（推荐）
+cd ~/openclaw
+./deploy.sh
+
 # 重新部署（代码更新后，--no-cache 确保新代码生效）
 cd ~/openclaw
-docker-compose down
-docker-compose build --no-cache openclaw
-docker-compose up -d
+docker compose build --no-cache
+docker compose up -d
+
+# nginx 前置模式重新部署
+cd ~/openclaw
+docker compose -f docker-compose.yml -f docker-compose.nginx.yml build --no-cache
+docker compose -f docker-compose.yml -f docker-compose.nginx.yml up -d
 
 # 查看容器状态
 docker ps
@@ -271,13 +332,14 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 - 消息里需含有触发关键词（最新、今天、天气、新闻等）
 
 **Q: .env 修改后不生效**
-- 必须重启容器：`docker-compose down && docker-compose up -d`
+- 可以直接重新运行 `./deploy.sh`，或手动执行 `docker compose up -d`
 - 检查 .env 是否有 Windows 换行符：`cat -A .env`（行尾出现 `^M` 则有问题）
 - 修复命令：`sed -i 's/\r//' .env`
 
 **Q: 飞书事件订阅填写请求网址后验证失败**
-- 确保服务已通过 `docker-compose up -d` 启动
-- 确认 Caddyfile 中的域名与实际域名一致，且 HTTPS 证书已签发
+- 确保服务已通过 `./deploy.sh` 或 `docker compose up -d` 启动
+- 模式 A 下，确认 Caddyfile 中的域名与实际域名一致，且 HTTPS 证书已签发
+- 模式 B 下，确认 nginx 已正确转发到 `127.0.0.1:8080`
 - 可用 `curl https://lobsterpro.online/feishu/webhook` 测试端口连通性
 
 **Q: 飞书机器人收到消息但不回复**

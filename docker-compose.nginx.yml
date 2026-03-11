@@ -1,0 +1,8 @@
+services:
+  caddy:
+    ports: !override
+      - "127.0.0.1:${NGINX_PROXY_PORT:-8080}:80"
+    volumes: !override
+      - ./Caddyfile.nginx:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config

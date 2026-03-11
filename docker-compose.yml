@@ -1,13 +1,12 @@
-version: "3.8"
-
 services:
   openclaw:
     build: .
     container_name: openclaw_service
     environment:
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - OPENAI_PROVIDER=${OPENAI_PROVIDER:-copilot}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1}
     restart: always
     networks:
@@ -16,8 +15,10 @@ services:
   telegram_bot:
     build: ./telegram_bot
     container_name: telegram_bot
+    profiles:
+      - telegram
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - OPENCLAW_URL=http://openclaw:8000
     depends_on:
       - openclaw
@@ -29,17 +30,16 @@ services:
     image: caddy:2-alpine
     container_name: caddy
     ports:
-      - "80:80"
-      - "443:443"
+      - "${CADDY_HTTP_BIND:-0.0.0.0}:${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_BIND:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     environment:
-      - DOMAIN=${DOMAIN}
+      - DOMAIN=${DOMAIN:-}
     depends_on:
       - openclaw
-      - feishu_bot
     restart: always
     networks:
       - claw_net
@@ -47,9 +47,11 @@ services:
   feishu_bot:
     build: ./feishu_bot
     container_name: feishu_bot
+    profiles:
+      - feishu
     environment:
-      - FEISHU_APP_ID=${FEISHU_APP_ID}
-      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+      - FEISHU_APP_ID=${FEISHU_APP_ID:-}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
       - FEISHU_VERIFICATION_TOKEN=${FEISHU_VERIFICATION_TOKEN:-}
       - FEISHU_ENCRYPT_KEY=${FEISHU_ENCRYPT_KEY:-}
       - OPENCLAW_URL=http://openclaw:8000

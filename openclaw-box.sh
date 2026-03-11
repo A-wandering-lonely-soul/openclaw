@@ -1,8 +1,25 @@
 #!/bin/bash
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONTAINERS=("openclaw_service" "telegram_bot")
 API_URL="http://localhost:8000"
+
+get_containers() {
+    local containers=("openclaw_service")
+
+    if docker ps -a --format '{{.Names}}' | grep -qx 'telegram_bot'; then
+        containers+=("telegram_bot")
+    fi
+
+    if docker ps -a --format '{{.Names}}' | grep -qx 'feishu_bot'; then
+        containers+=("feishu_bot")
+    fi
+
+    if docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
+        containers+=("caddy")
+    fi
+
+    printf '%s\n' "${containers[@]}"
+}
 
 show_menu() {
     local model_info provider model
@@ -100,34 +117,38 @@ clear_context() {
 
 restart_services() {
     echo "正在重启服务..."
-    docker restart "${CONTAINERS[@]}"
+    mapfile -t containers < <(get_containers)
+    docker restart "${containers[@]}"
     echo "✅ 重启完成"
 }
 
 stop_services() {
     echo "正在停止服务..."
-    docker stop "${CONTAINERS[@]}"
+    mapfile -t containers < <(get_containers)
+    docker stop "${containers[@]}"
     echo "✅ 服务已停止"
 }
 
 start_services() {
     echo "正在启动服务..."
-    docker start "${CONTAINERS[@]}"
+    mapfile -t containers < <(get_containers)
+    docker start "${containers[@]}"
     echo "✅ 服务已启动"
 }
 
 view_logs() {
-    echo ""
-    echo "--- openclaw_service 日志 (最近50行) ---"
-    docker logs --tail 50 openclaw_service
-    echo ""
-    echo "--- telegram_bot 日志 (最近50行) ---"
-    docker logs --tail 50 telegram_bot
+    mapfile -t containers < <(get_containers)
+    for container in "${containers[@]}"; do
+        echo ""
+        echo "--- $container 日志 (最近50行) ---"
+        docker logs --tail 50 "$container"
+    done
 }
 
 clear_logs() {
     echo "正在清空日志..."
-    for container in "${CONTAINERS[@]}"; do
+    mapfile -t containers < <(get_containers)
+    for container in "${containers[@]}"; do
         log_path=$(docker inspect --format='{{.LogPath}}' "$container" 2>/dev/null)
         if [ -n "$log_path" ] && [ -f "$log_path" ]; then
             truncate -s 0 "$log_path"

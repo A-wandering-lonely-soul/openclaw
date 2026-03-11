@@ -1,52 +1,406 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# -----------------------------
-# 配置：从交互式输入读取 Key（不要硬编码在文件中）
-# -----------------------------
-if [ ! -f ~/openclaw/.env ]; then
-    read -rp "请输入 GITHUB_TOKEN: " GITHUB_TOKEN
-    read -rp "请输入 TELEGRAM_BOT_TOKEN: " TELEGRAM_BOT_TOKEN
-    # 用 printf 写入保证 LF 行尾（不产生 CRLF 问题）
-    printf "GITHUB_TOKEN=%s\nTELEGRAM_BOT_TOKEN=%s\n" "$GITHUB_TOKEN" "$TELEGRAM_BOT_TOKEN" > ~/openclaw/.env
-    echo ".env 文件已创建"
-fi
+set -euo pipefail
 
-# 修复行尾符（防止 Windows 编辑导致 CRLF）
-sed -i 's/\r//' ~/openclaw/.env
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$PROJECT_DIR/.env"
+DEFAULT_PROXY_PORT=8080
 
-# -----------------------------
-# 安装 Docker & Docker Compose
-# -----------------------------
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl git
+DEPLOY_MODE=""
+DEPLOY_REASON=""
+DOMAIN=""
+NGINX_PROXY_PORT=""
+OPENAI_PROVIDER=""
+OPENAI_MODEL=""
+GITHUB_TOKEN=""
+DEEPSEEK_API_KEY=""
+TAVILY_API_KEY=""
+TELEGRAM_BOT_TOKEN=""
+FEISHU_APP_ID=""
+FEISHU_APP_SECRET=""
+FEISHU_VERIFICATION_TOKEN=""
+FEISHU_ENCRYPT_KEY=""
+ENABLE_TELEGRAM=0
+ENABLE_FEISHU=0
+ENABLE_TAVILY=0
+COMPOSE_ARGS=()
+DOCKER_CMD=("docker")
+COMPOSE_CMD=("docker" "compose")
 
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sudo sh get-docker.sh
-    sudo usermod -aG docker $USER
-    echo "Docker 安装完成，请退出重登录再运行此脚本"
-    exit
-fi
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-if ! command -v docker-compose &> /dev/null; then
-    sudo curl -L "https://github.com/docker/compose/releases/download/v2.21.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    sudo chmod +x /usr/local/bin/docker-compose
-fi
+prompt_value() {
+    local __var_name="$1"
+    local prompt_text="$2"
+    local default_value="${3:-}"
+    local secret="${4:-0}"
+    local allow_empty="${5:-0}"
+    local value=""
 
-# -----------------------------
-# 克隆项目目录 (可选)
-# -----------------------------
-mkdir -p ~/openclaw_gpt4
-cd ~/openclaw_gpt4
+    while true; do
+        if [ "$secret" = "1" ]; then
+            read -rsp "$prompt_text" value
+            echo ""
+        else
+            read -rp "$prompt_text" value
+        fi
 
-# -----------------------------
-# 启动服务
-# -----------------------------
-docker-compose up -d
+        if [ -z "$value" ]; then
+            value="$default_value"
+        fi
 
-echo "===================================="
-echo "部署完成！"
-echo "OpenClaw HTTPS: https://openclaw.example.com"
-echo "Telegram Bot 已就绪"
-echo "日志查看: docker logs -f openclaw_service / telegram_bot "
-echo "===================================="
+        if [ "$allow_empty" = "1" ] || [ -n "$value" ]; then
+            printf -v "$__var_name" '%s' "$value"
+            return
+        fi
+
+        echo "此项不能为空，请重新输入。"
+    done
+}
+
+prompt_yes_no() {
+    local prompt_text="$1"
+    local default_answer="${2:-y}"
+    local answer=""
+
+    while true; do
+        read -rp "$prompt_text" answer
+        answer="${answer:-$default_answer}"
+        case "$answer" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO) return 1 ;;
+            *) echo "请输入 y 或 n。" ;;
+        esac
+    done
+}
+
+port_in_use() {
+    local port="$1"
+
+    if command_exists ss; then
+        ss -ltn "( sport = :$port )" 2>/dev/null | tail -n +2 | grep -q .
+        return
+    fi
+
+    if command_exists netstat; then
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$port$"
+        return
+    fi
+
+    return 1
+}
+
+find_free_port() {
+    local port="$1"
+    while port_in_use "$port"; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
+resolve_docker_commands() {
+    if command_exists docker; then
+        if docker info >/dev/null 2>&1; then
+            DOCKER_CMD=("docker")
+        elif command_exists sudo && sudo docker info >/dev/null 2>&1; then
+            DOCKER_CMD=("sudo" "docker")
+        fi
+    fi
+
+    if "${DOCKER_CMD[@]}" compose version >/dev/null 2>&1; then
+        COMPOSE_CMD=("${DOCKER_CMD[@]}" "compose")
+        return
+    fi
+
+    if command_exists docker-compose; then
+        COMPOSE_CMD=("docker-compose")
+        return
+    fi
+
+    echo "未找到可用的 Docker Compose 命令。"
+    exit 1
+}
+
+install_docker_if_needed() {
+    if command_exists docker; then
+        return
+    fi
+
+    echo "未检测到 Docker，准备自动安装。"
+    if ! command_exists curl; then
+        sudo apt-get update
+        sudo apt-get install -y curl
+    fi
+
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+    sudo sh /tmp/get-docker.sh
+
+    if command_exists sudo; then
+        sudo usermod -aG docker "$USER" || true
+    fi
+
+    echo "Docker 安装完成。若当前用户尚未加入 docker 组生效，脚本会自动尝试使用 sudo。"
+}
+
+ensure_base_dependencies() {
+    if command_exists apt-get; then
+        sudo apt-get update
+        sudo apt-get install -y curl git ca-certificates
+    fi
+}
+
+detect_proxy_mode() {
+    if command_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+        DEPLOY_MODE="nginx"
+        DEPLOY_REASON="检测到 nginx 正在运行，自动切换为 nginx 前置模式。"
+        return
+    fi
+
+    if port_in_use 80 || port_in_use 443; then
+        DEPLOY_MODE="nginx"
+        DEPLOY_REASON="检测到 80 或 443 已被占用，自动切换为前置代理模式。"
+        return
+    fi
+
+    DEPLOY_MODE="caddy"
+    DEPLOY_REASON="检测到 80/443 空闲，将使用 Caddy 直接接管公网入口。"
+}
+
+choose_ai_provider() {
+    local provider_choice=""
+    local model_choice=""
+
+    echo "请选择默认 AI 提供商："
+    echo "  1) GitHub Copilot"
+    echo "  2) DeepSeek"
+
+    while true; do
+        read -rp "输入 1 或 2（默认 1）: " provider_choice
+        provider_choice="${provider_choice:-1}"
+        case "$provider_choice" in
+            1)
+                OPENAI_PROVIDER="copilot"
+                echo "请选择默认 Copilot 模型："
+                echo "  1) gpt-4.1"
+                echo "  2) gpt-4o"
+                echo "  3) gpt-4o-mini"
+                echo "  4) o3-mini"
+                echo "  5) o1-mini"
+                while true; do
+                    read -rp "输入 1-5（默认 1）: " model_choice
+                    model_choice="${model_choice:-1}"
+                    case "$model_choice" in
+                        1) OPENAI_MODEL="gpt-4.1" ; break ;;
+                        2) OPENAI_MODEL="gpt-4o" ; break ;;
+                        3) OPENAI_MODEL="gpt-4o-mini" ; break ;;
+                        4) OPENAI_MODEL="o3-mini" ; break ;;
+                        5) OPENAI_MODEL="o1-mini" ; break ;;
+                        *) echo "请输入有效选项。" ;;
+                    esac
+                done
+                prompt_value GITHUB_TOKEN "请输入 GITHUB_TOKEN: " "" 1 0
+                return
+                ;;
+            2)
+                OPENAI_PROVIDER="deepseek"
+                echo "请选择默认 DeepSeek 模型："
+                echo "  1) deepseek-chat"
+                echo "  2) deepseek-reasoner"
+                while true; do
+                    read -rp "输入 1 或 2（默认 1）: " model_choice
+                    model_choice="${model_choice:-1}"
+                    case "$model_choice" in
+                        1) OPENAI_MODEL="deepseek-chat" ; break ;;
+                        2) OPENAI_MODEL="deepseek-reasoner" ; break ;;
+                        *) echo "请输入有效选项。" ;;
+                    esac
+                done
+                prompt_value DEEPSEEK_API_KEY "请输入 DEEPSEEK_API_KEY: " "" 1 0
+                return
+                ;;
+            *) echo "请输入有效选项。" ;;
+        esac
+    done
+}
+
+collect_channel_config() {
+    if prompt_yes_no "是否启用 Telegram Bot？[Y/n]: " "y"; then
+        ENABLE_TELEGRAM=1
+        prompt_value TELEGRAM_BOT_TOKEN "请输入 TELEGRAM_BOT_TOKEN: " "" 1 0
+    fi
+
+    if prompt_yes_no "是否启用飞书机器人？[y/N]: " "n"; then
+        ENABLE_FEISHU=1
+        prompt_value FEISHU_APP_ID "请输入 FEISHU_APP_ID: " "" 0 0
+        prompt_value FEISHU_APP_SECRET "请输入 FEISHU_APP_SECRET: " "" 1 0
+        prompt_value FEISHU_VERIFICATION_TOKEN "请输入 FEISHU_VERIFICATION_TOKEN: " "" 0 0
+        prompt_value FEISHU_ENCRYPT_KEY "请输入 FEISHU_ENCRYPT_KEY（未启用加密可直接回车）: " "" 0 1
+    fi
+
+    if [ "$ENABLE_TELEGRAM" -eq 0 ] && [ "$ENABLE_FEISHU" -eq 0 ]; then
+        echo "未选择任何 Bot 渠道，本次仅部署 OpenClaw API 与反向代理。"
+    fi
+}
+
+collect_optional_config() {
+    if prompt_yes_no "是否启用 Tavily 联网搜索？[y/N]: " "n"; then
+        ENABLE_TAVILY=1
+        prompt_value TAVILY_API_KEY "请输入 TAVILY_API_KEY: " "" 1 0
+    fi
+}
+
+write_env_file() {
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    {
+        printf "DOMAIN=%s\n" "$DOMAIN"
+        printf "OPENAI_PROVIDER=%s\n" "$OPENAI_PROVIDER"
+        printf "OPENAI_MODEL=%s\n" "$OPENAI_MODEL"
+        printf "GITHUB_TOKEN=%s\n" "$GITHUB_TOKEN"
+        printf "DEEPSEEK_API_KEY=%s\n" "$DEEPSEEK_API_KEY"
+        printf "TAVILY_API_KEY=%s\n" "$TAVILY_API_KEY"
+        printf "TELEGRAM_BOT_TOKEN=%s\n" "$TELEGRAM_BOT_TOKEN"
+        printf "FEISHU_APP_ID=%s\n" "$FEISHU_APP_ID"
+        printf "FEISHU_APP_SECRET=%s\n" "$FEISHU_APP_SECRET"
+        printf "FEISHU_VERIFICATION_TOKEN=%s\n" "$FEISHU_VERIFICATION_TOKEN"
+        printf "FEISHU_ENCRYPT_KEY=%s\n" "$FEISHU_ENCRYPT_KEY"
+        if [ "$DEPLOY_MODE" = "nginx" ]; then
+            printf "NGINX_PROXY_PORT=%s\n" "$NGINX_PROXY_PORT"
+        fi
+    } > "$tmp_file"
+
+    tr -d '\r' < "$tmp_file" > "$ENV_FILE"
+    rm -f "$tmp_file"
+    echo ".env 已写入：$ENV_FILE"
+}
+
+build_compose_args() {
+    COMPOSE_ARGS=(-f "$PROJECT_DIR/docker-compose.yml")
+
+    if [ "$DEPLOY_MODE" = "nginx" ]; then
+        COMPOSE_ARGS+=(-f "$PROJECT_DIR/docker-compose.nginx.yml")
+    fi
+
+    if [ "$ENABLE_TELEGRAM" -eq 1 ]; then
+        COMPOSE_ARGS+=(--profile telegram)
+    fi
+
+    if [ "$ENABLE_FEISHU" -eq 1 ]; then
+        COMPOSE_ARGS+=(--profile feishu)
+    fi
+}
+
+build_compose_args_from_env() {
+    COMPOSE_ARGS=(-f "$PROJECT_DIR/docker-compose.yml")
+    ENABLE_TELEGRAM=0
+    ENABLE_FEISHU=0
+
+    if grep -q '^NGINX_PROXY_PORT=' "$ENV_FILE"; then
+        DEPLOY_MODE="nginx"
+        COMPOSE_ARGS+=(-f "$PROJECT_DIR/docker-compose.nginx.yml")
+    else
+        DEPLOY_MODE="caddy"
+    fi
+
+    if grep -q '^TELEGRAM_BOT_TOKEN=.' "$ENV_FILE"; then
+        ENABLE_TELEGRAM=1
+        COMPOSE_ARGS+=(--profile telegram)
+    fi
+
+    if grep -q '^FEISHU_APP_ID=.' "$ENV_FILE"; then
+        ENABLE_FEISHU=1
+        COMPOSE_ARGS+=(--profile feishu)
+    fi
+}
+
+show_summary() {
+    echo "===================================="
+    echo "部署模式: $DEPLOY_MODE"
+    echo "$DEPLOY_REASON"
+    echo "默认模型: [$OPENAI_PROVIDER] $OPENAI_MODEL"
+    if [ "$ENABLE_TELEGRAM" -eq 1 ]; then
+        echo "Telegram Bot: 已启用"
+    else
+        echo "Telegram Bot: 未启用"
+    fi
+    if [ "$ENABLE_FEISHU" -eq 1 ]; then
+        echo "飞书机器人: 已启用"
+    else
+        echo "飞书机器人: 未启用"
+    fi
+    if [ "$ENABLE_TAVILY" -eq 1 ]; then
+        echo "Tavily 搜索: 已启用"
+    else
+        echo "Tavily 搜索: 未启用"
+    fi
+    echo "===================================="
+}
+
+start_services() {
+    echo "开始构建并启动服务..."
+    "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" build
+    "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" up -d
+
+    echo "===================================="
+    echo "部署完成。"
+    if [ "$DEPLOY_MODE" = "nginx" ]; then
+        echo "本机代理端口: 127.0.0.1:${NGINX_PROXY_PORT:-$(grep '^NGINX_PROXY_PORT=' "$ENV_FILE" | cut -d= -f2)}"
+        echo "请将前置 nginx 反代到上述端口。"
+    else
+        echo "访问地址: https://$DOMAIN"
+    fi
+    echo "查看状态: ${COMPOSE_CMD[*]} ${COMPOSE_ARGS[*]} ps"
+    echo "查看日志: ${COMPOSE_CMD[*]} ${COMPOSE_ARGS[*]} logs -f"
+    echo "===================================="
+}
+
+maybe_use_existing_env() {
+    if [ ! -f "$ENV_FILE" ]; then
+        return 1
+    fi
+
+    echo "检测到已有 .env 文件。"
+    if prompt_yes_no "是否重新生成 .env？[y/N]: " "n"; then
+        cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d%H%M%S)"
+        return 1
+    fi
+
+    echo "保留现有 .env，直接启动服务。"
+    build_compose_args_from_env
+    start_services
+    return 0
+}
+
+main() {
+    ensure_base_dependencies
+    install_docker_if_needed
+    resolve_docker_commands
+
+    if maybe_use_existing_env; then
+        exit 0
+    fi
+
+    detect_proxy_mode
+    echo "$DEPLOY_REASON"
+
+    prompt_value DOMAIN "请输入对外访问域名（如 bot.example.com）: " "" 0 0
+
+    if [ "$DEPLOY_MODE" = "nginx" ]; then
+        local suggested_port
+        suggested_port="$(find_free_port "$DEFAULT_PROXY_PORT")"
+        prompt_value NGINX_PROXY_PORT "请输入本机反向代理端口（默认 $suggested_port）: " "$suggested_port" 0 0
+    fi
+
+    choose_ai_provider
+    collect_channel_config
+    collect_optional_config
+    write_env_file
+    build_compose_args
+    show_summary
+    start_services
+}
+
+main "$@"
