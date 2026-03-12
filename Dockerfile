@@ -10,6 +10,8 @@ RUN pip install -r requirements.txt
 
 COPY openclaw /app/openclaw
 
+RUN mkdir -p /app/workspace
+
 ENV OPENAI_API_KEY="${OPENAI_API_KEY}"
 
 EXPOSE 8000
