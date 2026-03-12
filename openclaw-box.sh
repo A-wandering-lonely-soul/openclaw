@@ -3,6 +3,33 @@
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 API_URL="http://localhost:8000"
 
+check_environment() {
+    # 检测 Windows 系统
+    local os
+    os="$(uname -s 2>/dev/null || echo unknown)"
+    case "$os" in
+        CYGWIN*|MINGW*|MSYS*)
+            echo "❌ 检测到 Windows 系统，OpenClaw 不支持在 Windows 上直接运行。"
+            echo "   请在 Linux 服务器上部署。"
+            exit 1
+            ;;
+    esac
+
+    # 检测 Docker
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "❌ 未检测到 Docker，请先安装 Docker。"
+        exit 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        echo "❌ Docker 未运行或当前用户无权限。"
+        echo "   请确认 Docker 已启动，或执行: sudo usermod -aG docker \$USER"
+        exit 1
+    fi
+}
+
+check_environment
+
 get_containers() {
     local containers=("openclaw_service")
 
@@ -41,6 +68,8 @@ show_menu() {
     echo "  5) 查看日志"
     echo "  6) 清空日志"
     echo "  7) 切换模型"
+    echo "  8) 重置配置（重新输入 Token 和域名）"
+    echo "  9) 卸载（停止并移除 Docker 容器）"
     echo "  0) 退出"
     echo "=============================="
     echo -n "请选择: "
@@ -159,6 +188,55 @@ clear_logs() {
     done
 }
 
+reset_config() {
+    echo ""
+    echo "⚠️  此操作将重新生成 .env 配置文件，现有配置会自动备份。"
+    read -rp "确认重置？(y/N): " confirm
+    case "$confirm" in
+        y|Y)
+            if [ -f "$PROJECT_DIR/.env" ]; then
+                cp "$PROJECT_DIR/.env" "$PROJECT_DIR/.env.bak.$(date +%Y%m%d%H%M%S)"
+                echo "已备份旧配置至 .env.bak.*"
+                rm -f "$PROJECT_DIR/.env"
+            fi
+            echo "正在启动配置向导..."
+            exec "$PROJECT_DIR/deploy.sh"
+            ;;
+        *)
+            echo "已取消"
+            ;;
+    esac
+}
+
+uninstall_services() {
+    echo ""
+    echo "⚠️  此操作将停止并移除所有 OpenClaw 相关 Docker 容器。"
+    read -rp "确认卸载？(y/N): " confirm
+    case "$confirm" in
+        y|Y)
+            echo "正在停止并移除容器..."
+            mapfile -t containers < <(get_containers)
+            docker stop "${containers[@]}" 2>/dev/null || true
+            docker rm "${containers[@]}" 2>/dev/null || true
+            echo "正在移除相关镜像..."
+            docker images --format '{{.Repository}}' \
+                | grep -E '^(openclaw|telegram.bot|feishu.bot)' \
+                | xargs -r docker rmi 2>/dev/null || true
+            read -rp "是否同时删除 .env 配置文件？(y/N): " del_env
+            case "$del_env" in
+                y|Y)
+                    rm -f "$PROJECT_DIR/.env"
+                    echo "✅ .env 已删除"
+                    ;;
+            esac
+            echo "✅ 卸载完成"
+            ;;
+        *)
+            echo "已取消"
+            ;;
+    esac
+}
+
 while true; do
     show_menu
     read -r choice
@@ -170,6 +248,8 @@ while true; do
         5) view_logs ;;
         6) clear_logs ;;
         7) switch_model ;;
+        8) reset_config ;;
+        9) uninstall_services ;;
         0) echo "退出。"; exit 0 ;;
         *) echo "❌ 无效选项，请重新输入" ;;
     esac

@@ -374,7 +374,28 @@ maybe_use_existing_env() {
     return 0
 }
 
+check_os() {
+    local os
+    os="$(uname -s 2>/dev/null || echo unknown)"
+    case "$os" in
+        CYGWIN*|MINGW*|MSYS*)
+            echo "❌ 检测到 Windows 系统，OpenClaw 不支持在 Windows 上直接运行。"
+            echo "   请在 Linux 服务器（Ubuntu 20.04/22.04）上部署。"
+            exit 1
+            ;;
+        Linux*)
+            ;;
+        Darwin*)
+            echo "⚠️  检测到 macOS，仅建议用于开发测试，生产环境请使用 Linux 服务器。"
+            ;;
+        *)
+            echo "⚠️  未知操作系统: $os，继续部署可能出现兼容性问题。"
+            ;;
+    esac
+}
+
 main() {
+    check_os
     ensure_base_dependencies
     install_docker_if_needed
     resolve_docker_commands
