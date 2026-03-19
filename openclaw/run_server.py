@@ -397,27 +397,54 @@ def tool_get_stock_price(symbol: str) -> str:
 
 
 def tool_get_gold_price(symbol: str = "Au99.99") -> str:
+    from datetime import datetime
+    results = []
+
+    # 数据源1：上海黄金交易所现货（日线，有延迟）
     try:
         import akshare as ak
         symbol = symbol.strip() or "Au99.99"
         df = ak.spot_hist_sge(symbol=symbol)
-        if df is None or df.empty:
-            return f"未获取到 {symbol} 的价格数据"
-        latest = df.iloc[-1]
-        date_val = latest.get("日期", latest.iloc[0])
-        close_val = latest.get("收盘价", latest.get("close", "N/A"))
-        high_val = latest.get("最高价", latest.get("high", "N/A"))
-        low_val = latest.get("最低价", latest.get("low", "N/A"))
-        vol_val = latest.get("成交量", latest.get("volume", "N/A"))
-        return (
-            f"【上海金交所 {symbol}】\n"
-            f"日期：{date_val}\n"
-            f"收盘价：{close_val} 元/克\n"
-            f"最高：{high_val}  最低：{low_val} 元/克\n"
-            f"成交量：{vol_val} 千克"
-        )
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
+            date_val = str(latest.get("日期", latest.iloc[0]))
+            close_val = latest.get("收盘价", latest.get("close", "N/A"))
+            high_val = latest.get("最高价", latest.get("high", "N/A"))
+            low_val = latest.get("最低价", latest.get("low", "N/A"))
+            vol_val = latest.get("成交量", latest.get("volume", "N/A"))
+            staleness = ""
+            try:
+                data_date = datetime.strptime(date_val[:10], "%Y-%m-%d").date()
+                days_diff = (datetime.now().date() - data_date).days
+                if days_diff > 3:
+                    staleness = f"\n⚠️ 该数据比今天滞后 {days_diff} 天，仅供参考"
+            except Exception:
+                pass
+            results.append(
+                f"【上海金交所现货 {symbol}】\n"
+                f"数据日期：{date_val}（当日收盘价）\n"
+                f"价格：{close_val} 元/克\n"
+                f"当日最高：{high_val}  最低：{low_val} 元/克\n"
+                f"成交量：{vol_val} 千克{staleness}"
+            )
     except Exception as e:
-        return f"黄金价格查询失败: {e}"
+        results.append(f"上海金交所现货数据获取失败: {e}")
+
+    # 数据源2：上海期货交易所黄金主力期货（更实时）
+    try:
+        import akshare as ak
+        df2 = ak.futures_zh_spot(symbol="沪金", market="金交所")
+        if df2 is not None and not df2.empty:
+            row = df2.iloc[0]
+            results.append(
+                f"\n【沪金主力期货（实时参考）】\n"
+                f"最新价：{row.get('最新价', row.get('price', 'N/A'))} 元/克\n"
+                f"涨跌：{row.get('涨跌', 'N/A')}  涨跌幅：{row.get('涨跌幅', 'N/A')}%"
+            )
+    except Exception:
+        pass
+
+    return "\n".join(results) if results else "黄金价格查询失败：所有数据源均无法访问"
 
 
 def execute_tool(name: str, args: dict) -> str:
