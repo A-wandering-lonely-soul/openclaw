@@ -141,6 +141,34 @@ TOOLS = [
                 "required": ["name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_price",
+            "description": "查询A股实时股价和基本行情。支持输入股票代码（如 000001、600519）或股票名称（如 平安银行、贵州茅台）。数据来自东方财富，交易时段内为实时行情。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "股票代码（如 000001）或股票名称（如 贵州茅台）"}
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_gold_price",
+            "description": "查询上海黄金交易所黄金现货价格。默认查询 Au99.99，也可指定其他品种如 Au100g、Au(T+D)。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "黄金品种代码，默认 Au99.99，可选 Au100g、Au(T+D) 等", "default": "Au99.99"}
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -343,6 +371,55 @@ def tool_remove_task(name: str) -> str:
     return f"✅ 任务 [{name}] 已删除"
 
 
+def tool_get_stock_price(symbol: str) -> str:
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+        symbol = symbol.strip()
+        result = df[df["代码"] == symbol]
+        if result.empty:
+            result = df[df["名称"].str.contains(symbol, na=False)]
+        if result.empty:
+            return f"未找到股票「{symbol}」，请确认股票代码或名称是否正确。"
+        row = result.iloc[0]
+        change = row.get("涨跌幅", "N/A")
+        sign = "+" if isinstance(change, (int, float)) and change > 0 else ""
+        return (
+            f"【{row['名称']}】{row['代码']}\n"
+            f"最新价：{row['最新价']} 元\n"
+            f"涨跌幅：{sign}{change}%\n"
+            f"今开：{row.get('今开', 'N/A')}  昨收：{row.get('昨收', 'N/A')}\n"
+            f"最高：{row.get('最高', 'N/A')}  最低：{row.get('最低', 'N/A')}\n"
+            f"成交量：{row.get('成交量', 'N/A')} 手  成交额：{row.get('成交额', 'N/A')} 元"
+        )
+    except Exception as e:
+        return f"股价查询失败: {e}"
+
+
+def tool_get_gold_price(symbol: str = "Au99.99") -> str:
+    try:
+        import akshare as ak
+        symbol = symbol.strip() or "Au99.99"
+        df = ak.spot_hist_sge(symbol=symbol)
+        if df is None or df.empty:
+            return f"未获取到 {symbol} 的价格数据"
+        latest = df.iloc[-1]
+        date_val = latest.get("日期", latest.iloc[0])
+        close_val = latest.get("收盘价", latest.get("close", "N/A"))
+        high_val = latest.get("最高价", latest.get("high", "N/A"))
+        low_val = latest.get("最低价", latest.get("low", "N/A"))
+        vol_val = latest.get("成交量", latest.get("volume", "N/A"))
+        return (
+            f"【上海金交所 {symbol}】\n"
+            f"日期：{date_val}\n"
+            f"收盘价：{close_val} 元/克\n"
+            f"最高：{high_val}  最低：{low_val} 元/克\n"
+            f"成交量：{vol_val} 千克"
+        )
+    except Exception as e:
+        return f"黄金价格查询失败: {e}"
+
+
 def execute_tool(name: str, args: dict) -> str:
     if name == "shell_exec":
         return tool_shell_exec(args.get("command", ""), args.get("timeout", 30))
@@ -362,6 +439,10 @@ def execute_tool(name: str, args: dict) -> str:
         return tool_list_tasks()
     elif name == "remove_task":
         return tool_remove_task(args.get("name", ""))
+    elif name == "get_stock_price":
+        return tool_get_stock_price(args.get("symbol", ""))
+    elif name == "get_gold_price":
+        return tool_get_gold_price(args.get("symbol", "Au99.99"))
     else:
         return f"未知工具: {name}"
 
@@ -389,6 +470,8 @@ def build_system_prompt(chat_id: str) -> str:
 - schedule_task：创建 cron 定时任务（服务重启后自动恢复）
 - list_tasks：列出所有定时任务
 - remove_task：删除定时任务
+- get_stock_price：查询A股实时股价（支持股票代码或名称，如"600519"或"贵州茅台"）
+- get_gold_price：查询上海金交所黄金现货价格（Au99.99 等品种）
 {tavily_line}
 
 工作原则：
