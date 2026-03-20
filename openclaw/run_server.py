@@ -373,29 +373,101 @@ def tool_remove_task(name: str) -> str:
 
 
 def tool_get_stock_price(symbol: str) -> str:
+    def _safe_num(value, scale=1):
+        if isinstance(value, (int, float)):
+            return value / scale
+        return value if value is not None else "N/A"
+
+    def _format_result(name, code, latest, pct, open_p, pre_close, high, low, volume, amount, source):
+        sign = "+" if isinstance(pct, (int, float)) and pct > 0 else ""
+        query_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"【{name}】{code}\n"
+            f"查询时间：{query_time}\n"
+            f"数据来源：{source}\n"
+            "数据说明：行情快照（接近实时，非逐笔成交）\n"
+            f"最新价：{latest} 元\n"
+            f"涨跌幅：{sign}{pct}%\n"
+            f"今开：{open_p}  昨收：{pre_close}\n"
+            f"最高：{high}  最低：{low}\n"
+            f"成交量：{volume} 手  成交额：{amount} 元"
+        )
+
+    symbol = (symbol or "").strip()
+    if not symbol:
+        return "股价查询失败: symbol 不能为空"
+
+    # 1) 首选 AKShare（支持代码和名称查询）
     try:
         import akshare as ak
         df = ak.stock_zh_a_spot_em()
-        symbol = symbol.strip()
         result = df[df["代码"] == symbol]
         if result.empty:
             result = df[df["名称"].str.contains(symbol, na=False)]
-        if result.empty:
-            return f"未找到股票「{symbol}」，请确认股票代码或名称是否正确。"
-        row = result.iloc[0]
-        change = row.get("涨跌幅", "N/A")
-        sign = "+" if isinstance(change, (int, float)) and change > 0 else ""
-        query_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return (
-            f"【{row['名称']}】{row['代码']}\n"
-            f"查询时间：{query_time}\n"
-            "数据说明：东方财富A股行情快照（通常为接近实时，非逐笔成交）\n"
-            f"最新价：{row['最新价']} 元\n"
-            f"涨跌幅：{sign}{change}%\n"
-            f"今开：{row.get('今开', 'N/A')}  昨收：{row.get('昨收', 'N/A')}\n"
-            f"最高：{row.get('最高', 'N/A')}  最低：{row.get('最低', 'N/A')}\n"
-            f"成交量：{row.get('成交量', 'N/A')} 手  成交额：{row.get('成交额', 'N/A')} 元"
-        )
+        if not result.empty:
+            row = result.iloc[0]
+            return _format_result(
+                name=row.get("名称", "N/A"),
+                code=row.get("代码", "N/A"),
+                latest=row.get("最新价", "N/A"),
+                pct=row.get("涨跌幅", "N/A"),
+                open_p=row.get("今开", "N/A"),
+                pre_close=row.get("昨收", "N/A"),
+                high=row.get("最高", "N/A"),
+                low=row.get("最低", "N/A"),
+                volume=row.get("成交量", "N/A"),
+                amount=row.get("成交额", "N/A"),
+                source="AKShare/东方财富",
+            )
+    except Exception:
+        pass
+
+    # 2) 兜底：东方财富直连 API（服务器上更稳）
+    try:
+        if not re.fullmatch(r"\d{6}", symbol):
+            return (
+                f"AKShare 查询失败，且无法用名称「{symbol}」走东方财富直连兜底。\n"
+                "请改用 6 位股票代码重试（如 600256）。"
+            )
+
+        secid = f"{'1' if symbol.startswith('6') else '0'}.{symbol}"
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "secid": secid,
+            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170",
+            "invt": "2",
+            "fltt": "2",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+
+        last_err = None
+        for _ in range(3):
+            try:
+                resp = http_requests.get(url, params=params, headers=headers, timeout=10)
+                resp.raise_for_status()
+                data = resp.json().get("data") or {}
+                if not data:
+                    raise ValueError("东方财富返回空数据")
+
+                return _format_result(
+                    name=data.get("f58", symbol),
+                    code=data.get("f57", symbol),
+                    latest=_safe_num(data.get("f43"), 100),
+                    pct=_safe_num(data.get("f170"), 100),
+                    open_p=_safe_num(data.get("f46"), 100),
+                    pre_close=_safe_num(data.get("f60"), 100),
+                    high=_safe_num(data.get("f44"), 100),
+                    low=_safe_num(data.get("f45"), 100),
+                    volume=data.get("f47", "N/A"),
+                    amount=data.get("f48", "N/A"),
+                    source="东方财富直连",
+                )
+            except Exception as e:
+                last_err = e
+        return f"股价查询失败: 东方财富直连重试后仍失败 ({last_err})"
     except Exception as e:
         return f"股价查询失败: {e}"
 
