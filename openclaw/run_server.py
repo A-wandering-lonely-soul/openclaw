@@ -147,7 +147,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_stock_price",
-            "description": "查询A股实时股价和基本行情。支持输入股票代码（如 000001、600519）或股票名称（如 平安银行、贵州茅台）。数据来自东方财富，交易时段内为实时行情。",
+            "description": "查询A股实时股价和基本行情。支持输入股票代码（如 000001、600519）或股票名称（如 平安银行、贵州茅台）。优先使用 Tushare Pro，失败时自动切换到 AKShare/东方财富/腾讯兜底。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -373,6 +373,8 @@ def tool_remove_task(name: str) -> str:
 
 
 def tool_get_stock_price(symbol: str) -> str:
+    import time
+
     def _safe_num(value, scale=1):
         if isinstance(value, (int, float)):
             return value / scale
@@ -397,30 +399,77 @@ def tool_get_stock_price(symbol: str) -> str:
     if not symbol:
         return "股价查询失败: symbol 不能为空"
 
-    # 1) 首选 AKShare（支持代码和名称查询）
-    try:
-        import akshare as ak
-        df = ak.stock_zh_a_spot_em()
-        result = df[df["代码"] == symbol]
-        if result.empty:
-            result = df[df["名称"].str.contains(symbol, na=False)]
-        if not result.empty:
-            row = result.iloc[0]
-            return _format_result(
-                name=row.get("名称", "N/A"),
-                code=row.get("代码", "N/A"),
-                latest=row.get("最新价", "N/A"),
-                pct=row.get("涨跌幅", "N/A"),
-                open_p=row.get("今开", "N/A"),
-                pre_close=row.get("昨收", "N/A"),
-                high=row.get("最高", "N/A"),
-                low=row.get("最低", "N/A"),
-                volume=row.get("成交量", "N/A"),
-                amount=row.get("成交额", "N/A"),
-                source="AKShare/东方财富",
-            )
-    except Exception:
-        pass
+    # 0) 主数据源：Tushare Pro（需要设置 TUSHARE_TOKEN）
+    tushare_token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if tushare_token:
+        try:
+            import tushare as ts
+            ts.set_token(tushare_token)
+            pro = ts.pro_api()
+
+            # 仅当是 6 位代码时直接映射，否则走名称模糊匹配
+            ts_code = None
+            if re.fullmatch(r"\d{6}", symbol):
+                ts_code = f"{symbol}.SH" if symbol.startswith("6") else f"{symbol}.SZ"
+            else:
+                basic_df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,symbol,name")
+                match = basic_df[basic_df["name"].str.contains(symbol, na=False)]
+                if not match.empty:
+                    ts_code = match.iloc[0]["ts_code"]
+
+            if ts_code:
+                quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=1)
+                if quote_df is not None and not quote_df.empty:
+                    row = quote_df.iloc[0]
+                    code = str(ts_code).split(".")[0]
+                    name_df = pro.stock_basic(ts_code=ts_code, fields="name")
+                    name = name_df.iloc[0]["name"] if name_df is not None and not name_df.empty else code
+                    pre_close = row.get("pre_close", "N/A")
+                    close = row.get("close", "N/A")
+                    pct = "N/A"
+                    if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
+                        pct = round((close - pre_close) / pre_close * 100, 2)
+                    return _format_result(
+                        name=name,
+                        code=code,
+                        latest=close,
+                        pct=pct,
+                        open_p=row.get("open", "N/A"),
+                        pre_close=pre_close,
+                        high=row.get("high", "N/A"),
+                        low=row.get("low", "N/A"),
+                        volume=row.get("vol", "N/A"),
+                        amount=row.get("amount", "N/A"),
+                        source="Tushare Pro",
+                    )
+        except Exception:
+            pass
+
+    # 1) 首选 AKShare（支持代码和名称查询，重试 2 次）
+    for _ in range(2):
+        try:
+            import akshare as ak
+            df = ak.stock_zh_a_spot_em()
+            result = df[df["代码"] == symbol]
+            if result.empty:
+                result = df[df["名称"].str.contains(symbol, na=False)]
+            if not result.empty:
+                row = result.iloc[0]
+                return _format_result(
+                    name=row.get("名称", "N/A"),
+                    code=row.get("代码", "N/A"),
+                    latest=row.get("最新价", "N/A"),
+                    pct=row.get("涨跌幅", "N/A"),
+                    open_p=row.get("今开", "N/A"),
+                    pre_close=row.get("昨收", "N/A"),
+                    high=row.get("最高", "N/A"),
+                    low=row.get("最低", "N/A"),
+                    volume=row.get("成交量", "N/A"),
+                    amount=row.get("成交额", "N/A"),
+                    source="AKShare/东方财富",
+                )
+        except Exception:
+            time.sleep(0.4)
 
     # 2) 兜底：东方财富直连 API（服务器上更稳）
     try:
@@ -467,6 +516,44 @@ def tool_get_stock_price(symbol: str) -> str:
                 )
             except Exception as e:
                 last_err = e
+                time.sleep(0.6)
+
+        # 3) 最后兜底：腾讯行情接口（无 key，字段较少）
+        try:
+            q_symbol = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
+            t_url = f"https://qt.gtimg.cn/q={q_symbol}"
+            t_resp = http_requests.get(
+                t_url,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+                timeout=10,
+            )
+            t_resp.raise_for_status()
+            text = t_resp.content.decode("gbk", errors="ignore")
+            parts = text.split("~")
+            # 关键字段：name=1, code=2, latest=3, pre_close=4, open=5, volume=6, amount=37
+            if len(parts) > 37 and parts[3]:
+                latest = float(parts[3]) if parts[3] not in ("", "0") else "N/A"
+                pre_close = float(parts[4]) if parts[4] not in ("", "0") else "N/A"
+                open_p = float(parts[5]) if parts[5] not in ("", "0") else "N/A"
+                pct = "N/A"
+                if isinstance(latest, float) and isinstance(pre_close, float) and pre_close != 0:
+                    pct = round((latest - pre_close) / pre_close * 100, 2)
+                return _format_result(
+                    name=parts[1] or symbol,
+                    code=parts[2] or symbol,
+                    latest=latest,
+                    pct=pct,
+                    open_p=open_p,
+                    pre_close=pre_close,
+                    high="N/A",
+                    low="N/A",
+                    volume=parts[6] if len(parts) > 6 else "N/A",
+                    amount=parts[37] if len(parts) > 37 else "N/A",
+                    source="腾讯行情直连",
+                )
+        except Exception:
+            pass
+
         return f"股价查询失败: 东方财富直连重试后仍失败 ({last_err})"
     except Exception as e:
         return f"股价查询失败: {e}"

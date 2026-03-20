@@ -5,7 +5,7 @@
 **主要功能：**
 - 支持多模型切换（GitHub Copilot GPT-4.1 / gpt-4o 等、DeepSeek V3 / R1）
 - 自动联网搜索（Tavily），问到实时信息时自动查询
-- A股行情双通道查询（AKShare 优先，失败自动切换东方财富直连）
+- A股行情多通道查询（Tushare Pro 优先，失败自动切换 AKShare/东方财富/腾讯兜底）
 - 保留对话历史上下文，支持多用户并发
 - 支持 Telegram Bot 和飞书机器人双渠道接入
 - 服务器管理面板 `openclaw-box`
@@ -78,6 +78,11 @@ openclaw/
 **Tavily API Key（可选，用于联网搜索）**
 1. 打开 [app.tavily.com](https://app.tavily.com) 注册（免费，每月 1000 次）
 2. 复制 API Key（格式：`tvly-...`）
+
+**Tushare Token（可选，推荐用于稳定 A 股行情）**
+1. 打开 [tushare.pro](https://tushare.pro) 注册账号
+2. 在个人中心获取 Token
+3. 填入 `.env` 的 `TUSHARE_TOKEN=...`
 
 ---
 
@@ -341,8 +346,8 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 - 消息里需含有触发关键词（最新、今天、天气、新闻等）
 
 **Q: A股查询失败或返回过旧数据**
-- 当前实现为双通道：先走 `AKShare`，失败自动切 `东方财富直连 API`
-- 若输入股票名称且 AKShare 源异常，建议改用 6 位股票代码（如 `600256`）以触发直连兜底
+- 当前实现为多通道：优先 `Tushare Pro`，失败自动切 `AKShare` -> `东方财富直连 API` -> `腾讯行情直连`
+- 若输入股票名称且兜底链路触发，建议改用 6 位股票代码（如 `600256`）以提高成功率
 - 可在容器内自检：`docker exec -i openclaw_service python -c "import akshare as ak; print(len(ak.stock_zh_a_spot_em()))"`
 - 若修改过 `run_server.py` 后未生效，执行：`docker compose restart openclaw`
 
