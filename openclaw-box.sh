@@ -66,11 +66,12 @@ show_menu() {
     echo " （3）重启所有服务"
     echo " （4）停止所有服务"
     echo " （5）启动所有服务"
-    echo " （6）查看日志"
-    echo " （7）清空日志"
-    echo " （8）切换模型"
-    echo " （9）重置配置（重新输入 Token 和域名）"
-    echo "（10）卸载（停止并移除 Docker 容器）"
+    echo " （6）查看应用日志（openclaw_service）"
+    echo " （7）查看全部容器日志"
+    echo " （8）清空日志"
+    echo " （9）切换模型"
+    echo "（10）重置配置（重新输入 Token 和域名）"
+    echo "（11）卸载（停止并移除 Docker 容器）"
     echo " （0）退出"
     echo "=============================="
     echo -n "请选择: "
@@ -181,6 +182,20 @@ start_services() {
     echo "✅ 服务已启动"
 }
 
+view_app_logs() {
+    echo ""
+    echo "--- openclaw_service 应用日志 ---"
+    echo " （1）最近 100 行"
+    echo " （2）实时跟踪（Ctrl+C 退出）"
+    echo -n "请选择: "
+    read -r log_choice
+    case "$log_choice" in
+        1) docker logs --tail 100 openclaw_service ;;
+        2) docker logs -f openclaw_service ;;
+        *) echo "❌ 无效选项" ;;
+    esac
+}
+
 view_logs() {
     mapfile -t containers < <(get_containers)
     for container in "${containers[@]}"; do
@@ -262,11 +277,12 @@ while true; do
         3) restart_services ;;
         4) stop_services ;;
         5) start_services ;;
-        6) view_logs ;;
-        7) clear_logs ;;
-        8) switch_model ;;
-        9) reset_config ;;
-        10) uninstall_services ;;
+        6) view_app_logs ;;
+        7) view_logs ;;
+        8) clear_logs ;;
+        9) switch_model ;;
+        10) reset_config ;;
+        11) uninstall_services ;;
         0) echo "退出。"; exit 0 ;;
         *) echo "❌ 无效选项，请重新输入" ;;
     esac

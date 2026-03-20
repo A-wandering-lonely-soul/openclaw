@@ -3,6 +3,7 @@ import re
 import json
 import subprocess
 from datetime import datetime
+import logging
 import requests as http_requests
 from openai import OpenAI
 from flask import Flask, request, jsonify
@@ -16,6 +17,9 @@ except ImportError:
     _tavily = None
 
 app = Flask(__name__)
+logger = logging.getLogger("openclaw")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
 
 PROVIDERS = {
     "copilot": {
@@ -380,6 +384,18 @@ def tool_get_stock_price(symbol: str) -> str:
             return value / scale
         return value if value is not None else "N/A"
 
+    def _normalize_price(value):
+        """东方财富字段在不同场景下可能是 7.12 或 712，做自适应缩放。"""
+        if not isinstance(value, (int, float)):
+            return value if value is not None else "N/A"
+        return value / 100 if value >= 100 else value
+
+    def _normalize_pct(value):
+        """涨跌幅字段可能是 0.35 或 35，做自适应缩放。"""
+        if not isinstance(value, (int, float)):
+            return value if value is not None else "N/A"
+        return value / 100 if abs(value) > 20 else value
+
     def _format_result(name, code, latest, pct, open_p, pre_close, high, low, volume, amount, source):
         sign = "+" if isinstance(pct, (int, float)) and pct > 0 else ""
         query_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -398,10 +414,12 @@ def tool_get_stock_price(symbol: str) -> str:
     symbol = (symbol or "").strip()
     if not symbol:
         return "股价查询失败: symbol 不能为空"
+    logger.info("[stock] query start symbol=%s", symbol)
 
     # 0) 主数据源：Tushare Pro（需要设置 TUSHARE_TOKEN）
     tushare_token = os.getenv("TUSHARE_TOKEN", "").strip()
     if tushare_token:
+        logger.info("[stock] trying Tushare Pro")
         try:
             import tushare as ts
             ts.set_token(tushare_token)
@@ -418,6 +436,7 @@ def tool_get_stock_price(symbol: str) -> str:
                     ts_code = match.iloc[0]["ts_code"]
 
             if ts_code:
+                logger.info("[stock] tushare resolved ts_code=%s", ts_code)
                 quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=1)
                 if quote_df is not None and not quote_df.empty:
                     row = quote_df.iloc[0]
@@ -442,12 +461,18 @@ def tool_get_stock_price(symbol: str) -> str:
                         amount=row.get("amount", "N/A"),
                         source="Tushare Pro",
                     )
+                logger.warning("[stock] tushare returned empty quote ts_code=%s", ts_code)
+            else:
+                logger.warning("[stock] tushare could not resolve symbol=%s", symbol)
         except Exception:
-            pass
+            logger.exception("[stock] tushare failed symbol=%s", symbol)
+    else:
+        logger.warning("[stock] TUSHARE_TOKEN missing, skip tushare")
 
     # 1) 首选 AKShare（支持代码和名称查询，重试 2 次）
     for _ in range(2):
         try:
+            logger.info("[stock] trying AKShare")
             import akshare as ak
             df = ak.stock_zh_a_spot_em()
             result = df[df["代码"] == symbol]
@@ -469,10 +494,12 @@ def tool_get_stock_price(symbol: str) -> str:
                     source="AKShare/东方财富",
                 )
         except Exception:
+            logger.exception("[stock] AKShare failed symbol=%s", symbol)
             time.sleep(0.4)
 
     # 2) 兜底：东方财富直连 API（服务器上更稳）
     try:
+        logger.info("[stock] trying Eastmoney direct")
         if not re.fullmatch(r"\d{6}", symbol):
             return (
                 f"AKShare 查询失败，且无法用名称「{symbol}」走东方财富直连兜底。\n"
@@ -504,22 +531,24 @@ def tool_get_stock_price(symbol: str) -> str:
                 return _format_result(
                     name=data.get("f58", symbol),
                     code=data.get("f57", symbol),
-                    latest=_safe_num(data.get("f43"), 100),
-                    pct=_safe_num(data.get("f170"), 100),
-                    open_p=_safe_num(data.get("f46"), 100),
-                    pre_close=_safe_num(data.get("f60"), 100),
-                    high=_safe_num(data.get("f44"), 100),
-                    low=_safe_num(data.get("f45"), 100),
+                    latest=_normalize_price(data.get("f43")),
+                    pct=_normalize_pct(data.get("f170")),
+                    open_p=_normalize_price(data.get("f46")),
+                    pre_close=_normalize_price(data.get("f60")),
+                    high=_normalize_price(data.get("f44")),
+                    low=_normalize_price(data.get("f45")),
                     volume=data.get("f47", "N/A"),
                     amount=data.get("f48", "N/A"),
                     source="东方财富直连",
                 )
             except Exception as e:
                 last_err = e
+                logger.exception("[stock] Eastmoney direct attempt failed symbol=%s", symbol)
                 time.sleep(0.6)
 
         # 3) 最后兜底：腾讯行情接口（无 key，字段较少）
         try:
+            logger.info("[stock] trying Tencent direct")
             q_symbol = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
             t_url = f"https://qt.gtimg.cn/q={q_symbol}"
             t_resp = http_requests.get(
@@ -552,10 +581,12 @@ def tool_get_stock_price(symbol: str) -> str:
                     source="腾讯行情直连",
                 )
         except Exception:
-            pass
+            logger.exception("[stock] Tencent direct failed symbol=%s", symbol)
 
+        logger.error("[stock] all sources failed symbol=%s last_err=%s", symbol, last_err)
         return f"股价查询失败: 东方财富直连重试后仍失败 ({last_err})"
     except Exception as e:
+        logger.exception("[stock] unexpected failure symbol=%s", symbol)
         return f"股价查询失败: {e}"
 
 
