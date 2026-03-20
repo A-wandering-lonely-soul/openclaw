@@ -357,10 +357,33 @@ show_summary() {
     echo "===================================="
 }
 
+setup_openclaw_box() {
+    local box_script="$PROJECT_DIR/openclaw-box.sh"
+    local box_link="/usr/local/bin/openclaw-box"
+
+    if [ ! -f "$box_script" ]; then
+        echo "⚠️  未找到 openclaw-box.sh，跳过管理命令安装。"
+        return
+    fi
+
+    chmod +x "$box_script" || true
+
+    if command_exists sudo; then
+        sudo ln -sf "$box_script" "$box_link"
+        sudo chmod +x "$box_link" || true
+    else
+        ln -sf "$box_script" "$box_link"
+        chmod +x "$box_link" || true
+    fi
+
+    echo "✅ 管理命令已安装：openclaw-box"
+}
+
 start_services() {
     echo "开始构建并启动服务..."
     "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" build
     "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" up -d
+    setup_openclaw_box
 
     echo "===================================="
     echo "部署完成。"
