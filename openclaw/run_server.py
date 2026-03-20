@@ -2,6 +2,7 @@ import os
 import re
 import json
 import subprocess
+from datetime import datetime
 import requests as http_requests
 from openai import OpenAI
 from flask import Flask, request, jsonify
@@ -384,8 +385,11 @@ def tool_get_stock_price(symbol: str) -> str:
         row = result.iloc[0]
         change = row.get("涨跌幅", "N/A")
         sign = "+" if isinstance(change, (int, float)) and change > 0 else ""
+        query_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return (
             f"【{row['名称']}】{row['代码']}\n"
+            f"查询时间：{query_time}\n"
+            "数据说明：东方财富A股行情快照（通常为接近实时，非逐笔成交）\n"
             f"最新价：{row['最新价']} 元\n"
             f"涨跌幅：{sign}{change}%\n"
             f"今开：{row.get('今开', 'N/A')}  昨收：{row.get('昨收', 'N/A')}\n"
@@ -397,54 +401,70 @@ def tool_get_stock_price(symbol: str) -> str:
 
 
 def tool_get_gold_price(symbol: str = "Au99.99") -> str:
-    from datetime import datetime
-    results = []
+    import akshare as ak
 
-    # 数据源1：上海黄金交易所现货（日线，有延迟）
-    try:
-        import akshare as ak
-        symbol = symbol.strip() or "Au99.99"
-        df = ak.spot_hist_sge(symbol=symbol)
-        if df is not None and not df.empty:
-            latest = df.iloc[-1]
-            date_val = str(latest.get("日期", latest.iloc[0]))
-            close_val = latest.get("收盘价", latest.get("close", "N/A"))
-            high_val = latest.get("最高价", latest.get("high", "N/A"))
-            low_val = latest.get("最低价", latest.get("low", "N/A"))
-            vol_val = latest.get("成交量", latest.get("volume", "N/A"))
-            staleness = ""
-            try:
-                data_date = datetime.strptime(date_val[:10], "%Y-%m-%d").date()
-                days_diff = (datetime.now().date() - data_date).days
-                if days_diff > 3:
-                    staleness = f"\n⚠️ 该数据比今天滞后 {days_diff} 天，仅供参考"
-            except Exception:
-                pass
-            results.append(
-                f"【上海金交所现货 {symbol}】\n"
-                f"数据日期：{date_val}（当日收盘价）\n"
-                f"价格：{close_val} 元/克\n"
-                f"当日最高：{high_val}  最低：{low_val} 元/克\n"
-                f"成交量：{vol_val} 千克{staleness}"
-            )
-    except Exception as e:
-        results.append(f"上海金交所现货数据获取失败: {e}")
+    symbol = (symbol or "Au99.99").strip() or "Au99.99"
+    today = datetime.now().date()
 
-    # 数据源2：上海期货交易所黄金主力期货（更实时）
+    realtime_text = ""
+    stale_text = ""
+
+    # 先尝试更实时的数据源：沪金行情
     try:
-        import akshare as ak
-        df2 = ak.futures_zh_spot(symbol="沪金", market="金交所")
-        if df2 is not None and not df2.empty:
-            row = df2.iloc[0]
-            results.append(
-                f"\n【沪金主力期货（实时参考）】\n"
-                f"最新价：{row.get('最新价', row.get('price', 'N/A'))} 元/克\n"
-                f"涨跌：{row.get('涨跌', 'N/A')}  涨跌幅：{row.get('涨跌幅', 'N/A')}%"
+        df_rt = ak.futures_zh_spot(symbol="沪金", market="CF")
+        if df_rt is not None and not df_rt.empty:
+            row = df_rt.iloc[0]
+            latest_price = row.get("最新价", row.get("price", "N/A"))
+            change_val = row.get("涨跌", row.get("change", "N/A"))
+            pct_val = row.get("涨跌幅", row.get("change_percent", "N/A"))
+            realtime_text = (
+                "【黄金实时参考（沪金）】\n"
+                f"最新价：{latest_price} 元/克\n"
+                f"涨跌：{change_val}  涨跌幅：{pct_val}%\n"
+                "说明：该值来自期货实时行情，可作为“现在金价”参考。"
             )
     except Exception:
         pass
 
-    return "\n".join(results) if results else "黄金价格查询失败：所有数据源均无法访问"
+    # 再取 SGE 现货日线作为补充信息（严格标注日期，不可当作今日价）
+    try:
+        df_spot = ak.spot_hist_sge(symbol=symbol)
+        if df_spot is not None and not df_spot.empty:
+            latest = df_spot.iloc[-1]
+            date_val = str(latest.get("日期", latest.iloc[0]))
+            close_val = latest.get("收盘价", latest.get("close", "N/A"))
+            high_val = latest.get("最高价", latest.get("high", "N/A"))
+            low_val = latest.get("最低价", latest.get("low", "N/A"))
+            spot_date = None
+            try:
+                spot_date = datetime.strptime(date_val[:10], "%Y-%m-%d").date()
+            except Exception:
+                spot_date = None
+            age_hint = ""
+            if spot_date is not None:
+                diff_days = (today - spot_date).days
+                if diff_days > 0:
+                    age_hint = f"（距今天 {diff_days} 天）"
+            stale_text = (
+                f"【上海金交所现货 {symbol}（历史收盘）】\n"
+                f"数据日期：{date_val}{age_hint}\n"
+                f"收盘价：{close_val} 元/克\n"
+                f"最高：{high_val}  最低：{low_val} 元/克"
+            )
+    except Exception:
+        pass
+
+    if realtime_text:
+        return realtime_text + (f"\n\n{stale_text}" if stale_text else "")
+
+    if stale_text:
+        return (
+            "⚠️ 当前无法获取黄金实时行情。\n"
+            "下面仅返回历史收盘数据，不能当作“今天/现在”的金价：\n\n"
+            f"{stale_text}"
+        )
+
+    return "黄金价格查询失败：实时与历史数据源均不可用，请稍后重试。"
 
 
 def execute_tool(name: str, args: dict) -> str:
@@ -508,7 +528,9 @@ def build_system_prompt(chat_id: str) -> str:
 4. 如果用户希望收到定时任务的执行结果，在调用 schedule_task 时将 notify_chat_id 设为 {chat_id}，系统会自动通过 Telegram 主动推送结果给用户。
 5. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。
 6. 任务完成后简洁告知用户结果和下次执行时间等关键信息。
-7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。"""
+7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。
+8. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。
+9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。"""
 
 # ─── 判断是否需要联网搜索 ─────────────────────────────────────────────────────
 
@@ -523,6 +545,17 @@ def needs_search(text: str) -> bool:
     if not _tavily:
         return False
     for kw in SEARCH_KEYWORDS:
+        if re.search(kw, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def is_market_quote_query(text: str) -> bool:
+    keywords = [
+        r"A股", r"股票", r"股价", r"上证", r"深证", r"创业板",
+        r"黄金", r"金价", r"沪金", r"Au99\.99", r"\b\d{6}\b"
+    ]
+    for kw in keywords:
         if re.search(kw, text, re.IGNORECASE):
             return True
     return False
@@ -567,7 +600,7 @@ def chat():
 
     # 联网搜索增强
     user_content = prompt
-    if needs_search(prompt):
+    if needs_search(prompt) and not is_market_quote_query(prompt):
         search_result = do_search(prompt)
         if search_result:
             user_content = (

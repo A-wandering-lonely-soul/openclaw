@@ -61,16 +61,17 @@ show_menu() {
         echo "   当前模型: [$provider] $model"
     fi
     echo "=============================="
-    echo "  1) 清空对话上下文"
-    echo "  2) 重启所有服务"
-    echo "  3) 停止所有服务"
-    echo "  4) 启动所有服务"
-    echo "  5) 查看日志"
-    echo "  6) 清空日志"
-    echo "  7) 切换模型"
-    echo "  8) 重置配置（重新输入 Token 和域名）"
-    echo "  9) 卸载（停止并移除 Docker 容器）"
-    echo "  0) 退出"
+    echo " （1）清空当前会话上下文"
+    echo " （2）清空所有人上下文"
+    echo " （3）重启所有服务"
+    echo " （4）停止所有服务"
+    echo " （5）启动所有服务"
+    echo " （6）查看日志"
+    echo " （7）清空日志"
+    echo " （8）切换模型"
+    echo " （9）重置配置（重新输入 Token 和域名）"
+    echo "（10）卸载（停止并移除 Docker 容器）"
+    echo " （0）退出"
     echo "=============================="
     echo -n "请选择: "
 }
@@ -78,8 +79,8 @@ show_menu() {
 switch_model() {
     echo ""
     echo "--- 选择服务提供商 ---"
-    echo "  1) GitHub Copilot"
-    echo "  2) DeepSeek"
+    echo " （1）GitHub Copilot"
+    echo " （2）DeepSeek"
     echo -n "请选择: "
     read -r provider_choice
 
@@ -89,11 +90,11 @@ switch_model() {
             provider="copilot"
             echo ""
             echo "--- Copilot 模型 ---"
-            echo "  1) gpt-4.1        GPT-4.1（默认）"
-            echo "  2) gpt-4o         GPT-4o（支持图片）"
-            echo "  3) gpt-4o-mini    GPT-4o Mini（轻量）"
-            echo "  4) o3-mini        o3 Mini（推理）"
-            echo "  5) o1-mini        o1 Mini（推理）"
+            echo " （1）gpt-4.1        GPT-4.1（默认）"
+            echo " （2）gpt-4o         GPT-4o（支持图片）"
+            echo " （3）gpt-4o-mini    GPT-4o Mini（轻量）"
+            echo " （4）o3-mini        o3 Mini（推理）"
+            echo " （5）o1-mini        o1 Mini（推理）"
             echo -n "请选择: "
             read -r model_choice
             case $model_choice in
@@ -109,8 +110,8 @@ switch_model() {
             provider="deepseek"
             echo ""
             echo "--- DeepSeek 模型 ---"
-            echo "  1) deepseek-chat      DeepSeek V3（对话）"
-            echo "  2) deepseek-reasoner  DeepSeek R1（推理）"
+            echo " （1）deepseek-chat      DeepSeek V3（对话）"
+            echo " （2）deepseek-reasoner  DeepSeek R1（推理）"
             echo -n "请选择: "
             read -r model_choice
             case $model_choice in
@@ -136,12 +137,27 @@ switch_model() {
     fi
 }
 
-clear_context() {
-    echo "正在清空对话上下文..."
-    curl -s -X POST http://localhost:8000/api/clear_context \
+clear_current_context() {
+    echo ""
+    echo "请输入要清空的 chat_id（示例：Telegram 私聊/群聊数字ID，或 feishu_xxx）"
+    read -rp "chat_id: " target_chat_id
+    if [ -z "$target_chat_id" ]; then
+        echo "❌ chat_id 不能为空"
+        return
+    fi
+    echo "正在清空会话 [$target_chat_id] 的上下文..."
+    curl -s -X POST "$API_URL/api/clear_context" \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\": \"${target_chat_id}\"}" > /dev/null
+    echo "✅ 会话 [$target_chat_id] 的上下文已清空"
+}
+
+clear_all_context() {
+    echo "正在清空所有人上下文..."
+    curl -s -X POST "$API_URL/api/clear_context" \
         -H "Content-Type: application/json" \
         -d '{"chat_id": "all"}' > /dev/null
-    echo "✅ 已发送清空请求（各用户下次对话时上下文将重置）"
+    echo "✅ 已清空所有会话上下文"
 }
 
 restart_services() {
@@ -241,15 +257,16 @@ while true; do
     show_menu
     read -r choice
     case $choice in
-        1) clear_context ;;
-        2) restart_services ;;
-        3) stop_services ;;
-        4) start_services ;;
-        5) view_logs ;;
-        6) clear_logs ;;
-        7) switch_model ;;
-        8) reset_config ;;
-        9) uninstall_services ;;
+        1) clear_current_context ;;
+        2) clear_all_context ;;
+        3) restart_services ;;
+        4) stop_services ;;
+        5) start_services ;;
+        6) view_logs ;;
+        7) clear_logs ;;
+        8) switch_model ;;
+        9) reset_config ;;
+        10) uninstall_services ;;
         0) echo "退出。"; exit 0 ;;
         *) echo "❌ 无效选项，请重新输入" ;;
     esac
