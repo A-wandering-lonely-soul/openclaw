@@ -15,6 +15,7 @@ OPENAI_MODEL=""
 GITHUB_TOKEN=""
 DEEPSEEK_API_KEY=""
 TAVILY_API_KEY=""
+TUSHARE_TOKEN=""
 TELEGRAM_BOT_TOKEN=""
 FEISHU_APP_ID=""
 FEISHU_APP_SECRET=""
@@ -23,6 +24,7 @@ FEISHU_ENCRYPT_KEY=""
 ENABLE_TELEGRAM=0
 ENABLE_FEISHU=0
 ENABLE_TAVILY=0
+ENABLE_TUSHARE=0
 COMPOSE_ARGS=()
 DOCKER_CMD=("docker")
 COMPOSE_CMD=("docker" "compose")
@@ -249,6 +251,11 @@ collect_optional_config() {
         ENABLE_TAVILY=1
         prompt_value TAVILY_API_KEY "请输入 TAVILY_API_KEY: " "" 1 0
     fi
+
+    if prompt_yes_no "是否启用 Tushare 作为 A股主数据源？[y/N]: " "n"; then
+        ENABLE_TUSHARE=1
+        prompt_value TUSHARE_TOKEN "请输入 TUSHARE_TOKEN: " "" 1 0
+    fi
 }
 
 write_env_file() {
@@ -262,6 +269,7 @@ write_env_file() {
         printf "GITHUB_TOKEN=%s\n" "$GITHUB_TOKEN"
         printf "DEEPSEEK_API_KEY=%s\n" "$DEEPSEEK_API_KEY"
         printf "TAVILY_API_KEY=%s\n" "$TAVILY_API_KEY"
+        printf "TUSHARE_TOKEN=%s\n" "$TUSHARE_TOKEN"
         printf "TELEGRAM_BOT_TOKEN=%s\n" "$TELEGRAM_BOT_TOKEN"
         printf "FEISHU_APP_ID=%s\n" "$FEISHU_APP_ID"
         printf "FEISHU_APP_SECRET=%s\n" "$FEISHU_APP_SECRET"
@@ -297,6 +305,7 @@ build_compose_args_from_env() {
     COMPOSE_ARGS=(-f "$PROJECT_DIR/docker-compose.yml")
     ENABLE_TELEGRAM=0
     ENABLE_FEISHU=0
+    ENABLE_TUSHARE=0
 
     if grep -q '^NGINX_PROXY_PORT=' "$ENV_FILE"; then
         DEPLOY_MODE="nginx"
@@ -313,6 +322,10 @@ build_compose_args_from_env() {
     if grep -q '^FEISHU_APP_ID=.' "$ENV_FILE"; then
         ENABLE_FEISHU=1
         COMPOSE_ARGS+=(--profile feishu)
+    fi
+
+    if grep -q '^TUSHARE_TOKEN=.' "$ENV_FILE"; then
+        ENABLE_TUSHARE=1
     fi
 }
 
@@ -335,6 +348,11 @@ show_summary() {
         echo "Tavily 搜索: 已启用"
     else
         echo "Tavily 搜索: 未启用"
+    fi
+    if [ "$ENABLE_TUSHARE" -eq 1 ]; then
+        echo "Tushare 主数据源: 已启用"
+    else
+        echo "Tushare 主数据源: 未启用（将使用其它数据源兜底）"
     fi
     echo "===================================="
 }

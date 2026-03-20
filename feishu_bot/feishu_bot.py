@@ -130,6 +130,9 @@ def webhook():
         if not user_text:
             return jsonify({"code": 0})
 
+        # 先给用户一个状态提示，模拟“正在思考”
+        reply_to_message(message_id, "🤔 正在思考中，请稍候…")
+
         # 调用 openclaw AI 服务
         try:
             resp = requests.post(

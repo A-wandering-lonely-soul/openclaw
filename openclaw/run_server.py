@@ -396,14 +396,21 @@ def tool_get_stock_price(symbol: str) -> str:
             return value if value is not None else "N/A"
         return value / 100 if abs(value) > 20 else value
 
-    def _format_result(name, code, latest, pct, open_p, pre_close, high, low, volume, amount, source):
+    def _format_result(
+        name, code, latest, pct, open_p, pre_close, high, low, volume, amount, source,
+        granularity="行情快照", data_time="N/A", fallback_note=""
+    ):
         sign = "+" if isinstance(pct, (int, float)) and pct > 0 else ""
         query_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        note_line = f"降级提示：{fallback_note}\n" if fallback_note else ""
         return (
             f"【{name}】{code}\n"
             f"查询时间：{query_time}\n"
             f"数据来源：{source}\n"
-            "数据说明：行情快照（接近实时，非逐笔成交）\n"
+            f"数据时间：{data_time}\n"
+            f"数据粒度：{granularity}\n"
+            f"{note_line}"
+            "数据说明：接近实时，非逐笔成交\n"
             f"最新价：{latest} 元\n"
             f"涨跌幅：{sign}{pct}%\n"
             f"今开：{open_p}  昨收：{pre_close}\n"
@@ -415,6 +422,7 @@ def tool_get_stock_price(symbol: str) -> str:
     if not symbol:
         return "股价查询失败: symbol 不能为空"
     logger.info("[stock] query start symbol=%s", symbol)
+    fallback_note = ""
 
     # 0) 主数据源：Tushare Pro（需要设置 TUSHARE_TOKEN）
     tushare_token = os.getenv("TUSHARE_TOKEN", "").strip()
@@ -437,31 +445,82 @@ def tool_get_stock_price(symbol: str) -> str:
 
             if ts_code:
                 logger.info("[stock] tushare resolved ts_code=%s", ts_code)
-                quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=1)
-                if quote_df is not None and not quote_df.empty:
-                    row = quote_df.iloc[0]
-                    code = str(ts_code).split(".")[0]
-                    name_df = pro.stock_basic(ts_code=ts_code, fields="name")
-                    name = name_df.iloc[0]["name"] if name_df is not None and not name_df.empty else code
-                    pre_close = row.get("pre_close", "N/A")
-                    close = row.get("close", "N/A")
-                    pct = "N/A"
-                    if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
-                        pct = round((close - pre_close) / pre_close * 100, 2)
-                    return _format_result(
-                        name=name,
-                        code=code,
-                        latest=close,
-                        pct=pct,
-                        open_p=row.get("open", "N/A"),
-                        pre_close=pre_close,
-                        high=row.get("high", "N/A"),
-                        low=row.get("low", "N/A"),
-                        volume=row.get("vol", "N/A"),
-                        amount=row.get("amount", "N/A"),
-                        source="Tushare Pro",
-                    )
-                logger.warning("[stock] tushare returned empty quote ts_code=%s", ts_code)
+                code = str(ts_code).split(".")[0]
+                name_df = pro.stock_basic(ts_code=ts_code, fields="name")
+                name = name_df.iloc[0]["name"] if name_df is not None and not name_df.empty else code
+
+                # 先尝试分钟级
+                minute_err = None
+                try:
+                    quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=5)
+                    if quote_df is not None and not quote_df.empty:
+                        row = quote_df.iloc[-1]
+                        data_time = (
+                            row.get("trade_time")
+                            or row.get("datetime")
+                            or row.get("trade_date")
+                            or row.get("date")
+                            or "N/A"
+                        )
+                        pre_close = row.get("pre_close", "N/A")
+                        close = row.get("close", "N/A")
+                        pct = "N/A"
+                        if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
+                            pct = round((close - pre_close) / pre_close * 100, 2)
+                        return _format_result(
+                            name=name,
+                            code=code,
+                            latest=close,
+                            pct=pct,
+                            open_p=row.get("open", "N/A"),
+                            pre_close=pre_close,
+                            high=row.get("high", "N/A"),
+                            low=row.get("low", "N/A"),
+                            volume=row.get("vol", "N/A"),
+                            amount=row.get("amount", "N/A"),
+                            source="Tushare Pro",
+                            granularity="1分钟K线",
+                            data_time=str(data_time),
+                        )
+                    logger.warning("[stock] tushare 1min returned empty ts_code=%s", ts_code)
+                except Exception:
+                    minute_err = True
+                    logger.exception("[stock] tushare 1min failed, fallback to daily ts_code=%s", ts_code)
+                    fallback_note = "Tushare 分钟级接口不可用，已自动降级为日线（可能是接口次数受限）"
+
+                # 分钟级失败则降级到日线（仍然优先使用 Tushare）
+                try:
+                    daily_df = pro.daily(ts_code=ts_code, limit=1)
+                    if daily_df is not None and not daily_df.empty:
+                        row = daily_df.iloc[0]
+                        pre_close = row.get("pre_close", "N/A")
+                        close = row.get("close", "N/A")
+                        pct = "N/A"
+                        if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
+                            pct = round((close - pre_close) / pre_close * 100, 2)
+                        return _format_result(
+                            name=name,
+                            code=code,
+                            latest=close,
+                            pct=pct,
+                            open_p=row.get("open", "N/A"),
+                            pre_close=pre_close,
+                            high=row.get("high", "N/A"),
+                            low=row.get("low", "N/A"),
+                            volume=row.get("vol", "N/A"),
+                            amount=row.get("amount", "N/A"),
+                            source="Tushare Pro",
+                            granularity="日线收盘（降级）",
+                            data_time=str(row.get("trade_date", "N/A")),
+                            fallback_note=fallback_note,
+                        )
+                    logger.warning("[stock] tushare daily returned empty ts_code=%s", ts_code)
+                    if minute_err:
+                        fallback_note = "Tushare 分钟级失败且日线为空，已切换到备用数据源（可能是接口次数受限）"
+                except Exception:
+                    logger.exception("[stock] tushare daily fallback failed ts_code=%s", ts_code)
+                    if minute_err:
+                        fallback_note = "Tushare 分钟级/日线均失败，已切换到备用数据源（可能是接口次数受限）"
             else:
                 logger.warning("[stock] tushare could not resolve symbol=%s", symbol)
         except Exception:
@@ -469,40 +528,14 @@ def tool_get_stock_price(symbol: str) -> str:
     else:
         logger.warning("[stock] TUSHARE_TOKEN missing, skip tushare")
 
-    # 1) 首选 AKShare（支持代码和名称查询，重试 2 次）
-    for _ in range(2):
-        try:
-            logger.info("[stock] trying AKShare")
-            import akshare as ak
-            df = ak.stock_zh_a_spot_em()
-            result = df[df["代码"] == symbol]
-            if result.empty:
-                result = df[df["名称"].str.contains(symbol, na=False)]
-            if not result.empty:
-                row = result.iloc[0]
-                return _format_result(
-                    name=row.get("名称", "N/A"),
-                    code=row.get("代码", "N/A"),
-                    latest=row.get("最新价", "N/A"),
-                    pct=row.get("涨跌幅", "N/A"),
-                    open_p=row.get("今开", "N/A"),
-                    pre_close=row.get("昨收", "N/A"),
-                    high=row.get("最高", "N/A"),
-                    low=row.get("最低", "N/A"),
-                    volume=row.get("成交量", "N/A"),
-                    amount=row.get("成交额", "N/A"),
-                    source="AKShare/东方财富",
-                )
-        except Exception:
-            logger.exception("[stock] AKShare failed symbol=%s", symbol)
-            time.sleep(0.4)
+    # AKShare：保持为可选兜底，放到最后尝试（避免它在部分时段频繁失败抢占其它来源）
 
     # 2) 兜底：东方财富直连 API（服务器上更稳）
     try:
         logger.info("[stock] trying Eastmoney direct")
         if not re.fullmatch(r"\d{6}", symbol):
             return (
-                f"AKShare 查询失败，且无法用名称「{symbol}」走东方财富直连兜底。\n"
+                f"无法用名称「{symbol}」走东方财富直连兜底。\n"
                 "请改用 6 位股票代码重试（如 600256）。"
             )
 
@@ -540,6 +573,9 @@ def tool_get_stock_price(symbol: str) -> str:
                     volume=data.get("f47", "N/A"),
                     amount=data.get("f48", "N/A"),
                     source="东方财富直连",
+                    granularity="行情快照",
+                    data_time="N/A",
+                    fallback_note=fallback_note,
                 )
             except Exception as e:
                 last_err = e
@@ -579,9 +615,46 @@ def tool_get_stock_price(symbol: str) -> str:
                     volume=parts[6] if len(parts) > 6 else "N/A",
                     amount=parts[37] if len(parts) > 37 else "N/A",
                     source="腾讯行情直连",
+                    granularity="行情快照",
+                    data_time="N/A",
+                    fallback_note=fallback_note,
                 )
         except Exception:
             logger.exception("[stock] Tencent direct failed symbol=%s", symbol)
+
+        # 4) 最后兜底：AKShare（支持代码和名称查询，但对源站更敏感，故放最后）
+        try:
+            for _ in range(2):
+                try:
+                    logger.info("[stock] trying AKShare (optional last resort)")
+                    import akshare as ak
+                    df = ak.stock_zh_a_spot_em()
+                    result = df[df["代码"] == symbol]
+                    if result.empty:
+                        result = df[df["名称"].str.contains(symbol, na=False)]
+                    if not result.empty:
+                        row = result.iloc[0]
+                        return _format_result(
+                            name=row.get("名称", "N/A"),
+                            code=row.get("代码", "N/A"),
+                            latest=row.get("最新价", "N/A"),
+                            pct=row.get("涨跌幅", "N/A"),
+                            open_p=row.get("今开", "N/A"),
+                            pre_close=row.get("昨收", "N/A"),
+                            high=row.get("最高", "N/A"),
+                            low=row.get("最低", "N/A"),
+                            volume=row.get("成交量", "N/A"),
+                            amount=row.get("成交额", "N/A"),
+                            source="AKShare/东方财富",
+                            granularity="行情快照",
+                            data_time="N/A",
+                            fallback_note=fallback_note,
+                        )
+                except Exception:
+                    logger.exception("[stock] AKShare last-resort failed symbol=%s", symbol)
+                    time.sleep(0.4)
+        except Exception:
+            logger.exception("[stock] AKShare optional block unexpected failure symbol=%s", symbol)
 
         logger.error("[stock] all sources failed symbol=%s last_err=%s", symbol, last_err)
         return f"股价查询失败: 东方财富直连重试后仍失败 ({last_err})"
@@ -594,30 +667,121 @@ def tool_get_gold_price(symbol: str = "Au99.99") -> str:
     import akshare as ak
 
     symbol = (symbol or "Au99.99").strip() or "Au99.99"
-    today = datetime.now().date()
+    logger.info("[gold] query start symbol=%s", symbol)
 
-    realtime_text = ""
-    stale_text = ""
+    def _pick(latest_obj, keys, default="N/A"):
+        for k in keys:
+            try:
+                v = latest_obj.get(k, None)
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            # 去掉空字符串/占位符
+            if isinstance(v, str) and not v.strip():
+                continue
+            return v
+        return default
 
-    # 先尝试更实时的数据源：沪金行情
+    def _to_float(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            sv = str(v).strip()
+            if sv in ("", "N/A"):
+                return None
+            return float(sv)
+        except Exception:
+            return None
+
+    gold_realtime_err = None
+
+    # 1) 优先：上海金交所分钟级/近实时现货报价（AKShare spot_quotations_sge）
     try:
-        df_rt = ak.futures_zh_spot(symbol="沪金", market="CF")
+        logger.info("[gold] trying spot_quotations_sge")
+        df_rt = ak.spot_quotations_sge(symbol=symbol)
         if df_rt is not None and not df_rt.empty:
-            row = df_rt.iloc[0]
-            latest_price = row.get("最新价", row.get("price", "N/A"))
-            change_val = row.get("涨跌", row.get("change", "N/A"))
-            pct_val = row.get("涨跌幅", row.get("change_percent", "N/A"))
-            realtime_text = (
-                "【黄金实时参考（沪金）】\n"
-                f"最新价：{latest_price} 元/克\n"
-                f"涨跌：{change_val}  涨跌幅：{pct_val}%\n"
-                "说明：该值来自期货实时行情，可作为“现在金价”参考。"
+            latest = df_rt.iloc[-1]
+            latest_price = _to_float(
+                _pick(
+                    latest,
+                    [
+                        "现价",
+                        "最新价",
+                        "价格",
+                        "close",
+                        "Close",
+                        "现货价",
+                        "现货价格",
+                        "成交价",
+                        "最新成交价",
+                        "最新成交价格",
+                    ],
+                )
             )
-    except Exception:
+            update_time = _pick(
+                latest,
+                [
+                    "更新时间",
+                    "更新",
+                    "时间",
+                    "datetime",
+                    "date",
+                    "last_update_time",
+                    "lastUpdate",
+                    "更新时间(北京时间)",
+                ],
+            )
+
+            # 时间尽量输出原样，若取不到也不硬猜
+            gran = "分钟级/近实时"
+            if latest_price is not None:
+                return (
+                    f"【上海金交所现货 {symbol}】\n"
+                    f"数据粒度：{gran}\n"
+                    f"数据时间：{update_time}\n"
+                    f"最新价：{latest_price} 元/克"
+                )
+            logger.warning(
+                "[gold] spot_quotations_sge price parse failed (latest_price=None). columns=%s",
+                list(df_rt.columns),
+            )
+        logger.warning("[gold] spot_quotations_sge returned empty or unparsable")
+    except Exception as e:
+        logger.exception("[gold] spot_quotations_sge failed")
+        gold_realtime_err = f"spot_quotations_sge 异常：{type(e).__name__}: {e}"
         pass
 
-    # 再取 SGE 现货日线作为补充信息（严格标注日期，不可当作今日价）
+    # 2) 备选：沪金期货实时参考
+    for market_value in ["CF", "金交所", ""]:
+        try:
+            logger.info("[gold] trying futures_zh_spot (沪金, market=%s)", market_value)
+            if market_value:
+                df_rt2 = ak.futures_zh_spot(symbol="沪金", market=market_value)
+            else:
+                df_rt2 = ak.futures_zh_spot(symbol="沪金")
+            if df_rt2 is not None and not df_rt2.empty:
+                row = df_rt2.iloc[0]
+                latest_price = row.get("最新价", row.get("price", "N/A"))
+                change_val = row.get("涨跌", row.get("change", "N/A"))
+                pct_val = row.get("涨跌幅", row.get("change_percent", "N/A"))
+                return (
+                    "【黄金实时参考（沪金期货）】\n"
+                    "数据粒度：实时参考\n"
+                    f"最新价：{latest_price} 元/克\n"
+                    f"涨跌：{change_val}  涨跌幅：{pct_val}%"
+                )
+            logger.warning("[gold] futures_zh_spot empty (market=%s)", market_value)
+        except Exception as e:
+            logger.exception("[gold] futures_zh_spot failed (market=%s)", market_value)
+            if not gold_realtime_err:
+                gold_realtime_err = f"futures_zh_spot 异常：{type(e).__name__}: {e}"
+        # 若已成功 return，则不会执行到这里
+        pass
+
+    # 3) 最后：SGE 现货日线收盘（历史，仅供参考）
     try:
+        logger.info("[gold] trying spot_hist_sge (historical close)")
         df_spot = ak.spot_hist_sge(symbol=symbol)
         if df_spot is not None and not df_spot.empty:
             latest = df_spot.iloc[-1]
@@ -625,34 +789,19 @@ def tool_get_gold_price(symbol: str = "Au99.99") -> str:
             close_val = latest.get("收盘价", latest.get("close", "N/A"))
             high_val = latest.get("最高价", latest.get("high", "N/A"))
             low_val = latest.get("最低价", latest.get("low", "N/A"))
-            spot_date = None
-            try:
-                spot_date = datetime.strptime(date_val[:10], "%Y-%m-%d").date()
-            except Exception:
-                spot_date = None
-            age_hint = ""
-            if spot_date is not None:
-                diff_days = (today - spot_date).days
-                if diff_days > 0:
-                    age_hint = f"（距今天 {diff_days} 天）"
-            stale_text = (
+            err_line = f"实时接口错误：{gold_realtime_err}\n\n" if gold_realtime_err else "\n"
+            return (
+                f"⚠️ 当前无法获取黄金实时行情。\n"
+                f"下面仅返回历史收盘数据（不能当作“今天/现在”的金价）：\n"
+                f"{err_line}"
                 f"【上海金交所现货 {symbol}（历史收盘）】\n"
-                f"数据日期：{date_val}{age_hint}\n"
+                f"数据日期：{date_val}\n"
                 f"收盘价：{close_val} 元/克\n"
                 f"最高：{high_val}  最低：{low_val} 元/克"
             )
     except Exception:
+        logger.exception("[gold] spot_hist_sge failed")
         pass
-
-    if realtime_text:
-        return realtime_text + (f"\n\n{stale_text}" if stale_text else "")
-
-    if stale_text:
-        return (
-            "⚠️ 当前无法获取黄金实时行情。\n"
-            "下面仅返回历史收盘数据，不能当作“今天/现在”的金价：\n\n"
-            f"{stale_text}"
-        )
 
     return "黄金价格查询失败：实时与历史数据源均不可用，请稍后重试。"
 
