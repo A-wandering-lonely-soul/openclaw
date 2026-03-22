@@ -129,6 +129,7 @@ chmod +x deploy.sh
 - 只在你选择 DeepSeek 作为默认模型时询问 `DEEPSEEK_API_KEY`
 - 只在你启用联网搜索时询问 `TAVILY_API_KEY`
 - 只启动你选中的 Bot 服务，未选中的 Telegram/飞书容器不会启动
+- **模式 B（nginx 前置）** 时，会根据 `NGINX_PROXY_PORT` 自动生成 `nginx/generated/openclaw-docker.conf`，并提示如何 `include` 到现有站点（可与静态前端并存，见下文「6. nginx 前置模式配置」）
 
 脚本支持两种代理模式：
 
@@ -182,20 +183,39 @@ docker compose --profile telegram --profile feishu up -d
 
 ### 6. nginx 前置模式配置
 
-如果你使用“模式 B”，把 [nginx/openclaw.conf.example](nginx/openclaw.conf.example) 放到 nginx 站点配置目录，替换其中域名和证书路径后启用。
+模式 B 下，容器内 Caddy 只监听本机端口（默认 `127.0.0.1:8080`），由**宿主机 nginx** 对外提供 443，再反代到该端口。Caddy 会按路径分发：
+- `/feishu/*` → `feishu_bot`
+- 其余（含 `/api/*`）→ `openclaw`
 
-这个配置会把 nginx 收到的 HTTPS 请求转发到本机 `127.0.0.1:8080`，再由容器内 Caddy 按路径分发：
-- `/feishu/*` 转给 `feishu_bot`
-- 其余路径转给 `openclaw`
+**方式一：整站都交给 OpenClaw（无其它静态站）**
 
-典型启用步骤：
+把 [nginx/openclaw.conf.example](nginx/openclaw.conf.example) 复制为站点配置，替换域名与证书路径；其中 `proxy_pass http://127.0.0.1:8080` 需与 `.env` 里 `NGINX_PROXY_PORT` 一致。
 
 ```bash
 sudo cp ~/openclaw/nginx/openclaw.conf.example /etc/nginx/sites-available/openclaw.conf
+# 编辑域名、证书路径、以及 8080 端口是否与 .env 一致
 sudo ln -s /etc/nginx/sites-available/openclaw.conf /etc/nginx/sites-enabled/openclaw.conf
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+**方式二：同一域名上已有静态前端（如 `root .../dist`），只把 OpenClaw 路径让出来**
+
+运行 `./deploy.sh` 选择模式 B 后，会生成 **`nginx/generated/openclaw-docker.conf`**（由 [nginx/openclaw-proxy-locations.snippet](nginx/openclaw-proxy-locations.snippet) 按端口展开）。在对外 **HTTPS** 的 `server { }` 里、在 `location /` 与静态 `root` 之前加入：
+
+```nginx
+include /etc/nginx/snippets/openclaw-docker.conf;
+```
+
+并把生成文件拷到系统目录（路径可自定，与 `include` 一致即可）：
+
+```bash
+sudo mkdir -p /etc/nginx/snippets
+sudo cp ~/openclaw/nginx/generated/openclaw-docker.conf /etc/nginx/snippets/openclaw-docker.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+片段中包含 **`/feishu/`**（飞书 Webhook）与 **`/api/`**（OpenClaw API），避免整站 `proxy_pass` 覆盖你的前端路由。
 
 ### 7. 验证服务状态
 

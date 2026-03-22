@@ -1,0 +1,31 @@
+# OpenClaw（Docker 内 Caddy）反向代理片段
+# 由 deploy.sh 根据 NGINX_PROXY_PORT 生成为 nginx/generated/openclaw-docker.conf
+#
+# 用法（二选一）：
+#   1) 在对外 HTTPS 的 server { } 内加入一行（推荐）：
+#        include /etc/nginx/snippets/openclaw-docker.conf;
+#   2) 将生成文件中的 location 块复制进你的 server { }（放在「静态站 root / try_files」之前）
+#
+# 说明：/feishu/ 供飞书 Webhook；/api/ 供 OpenClaw HTTP API（与 README 中 curl 示例一致）。
+
+location /feishu/ {
+    proxy_pass http://127.0.0.1:__PORT__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    client_max_body_size 20m;
+}
+
+location /api/ {
+    proxy_pass http://127.0.0.1:__PORT__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    client_max_body_size 20m;
+}
