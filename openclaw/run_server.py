@@ -2,7 +2,7 @@ import os
 import re
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import requests as http_requests
 from openai import OpenAI
@@ -839,6 +839,11 @@ _restore_tasks()
 # ─── 系统提示词（动态，含当前 chat_id）──────────────────────────────────────
 
 def build_system_prompt(chat_id: str) -> str:
+    now = datetime.now().astimezone()
+    now_iso = now.isoformat(timespec="seconds")
+    today = now.strftime("%Y-%m-%d")
+    timezone_name = now.tzname() or "local"
+
     tavily_line = (
         "- 实时搜索（后端自动）：当用户询问天气、新闻、价格等实时信息时，后端会自动用 Tavily 搜索引擎查询，"
         "并将搜索结果注入到用户消息的开头。你只需直接基于这些已注入的内容回答，"
@@ -847,6 +852,7 @@ def build_system_prompt(chat_id: str) -> str:
 
     return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
 当前用户的 chat_id 为：{chat_id}
+当前服务器时间为：{now_iso}（时区：{timezone_name}，今天日期：{today}）
 
 你拥有以下能力：
 - shell_exec：在 /app/workspace 目录执行 Shell 命令
@@ -869,7 +875,8 @@ def build_system_prompt(chat_id: str) -> str:
 6. 任务完成后简洁告知用户结果和下次执行时间等关键信息。
 7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。
 8. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。
-9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。"""
+9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。
+10. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"""
 
 # ─── 判断是否需要联网搜索 ─────────────────────────────────────────────────────
 
@@ -898,6 +905,38 @@ def is_market_quote_query(text: str) -> bool:
         if re.search(kw, text, re.IGNORECASE):
             return True
     return False
+
+
+def is_weather_query(text: str) -> bool:
+    return bool(re.search(r"天气|气温|温度|下雨|降雨|风力|空气质量|预报", text, re.IGNORECASE))
+
+
+def resolve_weather_target_date(text: str):
+    now = datetime.now().astimezone()
+    offset = None
+    label = ""
+
+    if re.search(r"大后天", text):
+        offset = 3
+        label = "大后天"
+    elif re.search(r"后天", text):
+        offset = 2
+        label = "后天"
+    elif re.search(r"明天", text):
+        offset = 1
+        label = "明天"
+    elif re.search(r"今天|今日", text):
+        offset = 0
+        label = "今天"
+
+    if offset is None:
+        return None
+
+    target = now + timedelta(days=offset)
+    return {
+        "label": label,
+        "date": target.strftime("%Y-%m-%d"),
+    }
 
 
 def do_search(query: str) -> str:
@@ -940,10 +979,24 @@ def chat():
     # 联网搜索增强
     user_content = prompt
     if needs_search(prompt) and not is_market_quote_query(prompt):
-        search_result = do_search(prompt)
+        search_query = prompt
+        weather_guard = ""
+
+        if is_weather_query(prompt):
+            target = resolve_weather_target_date(prompt)
+            if target:
+                search_query = f"{prompt} {target['date']} 天气预报"
+                weather_guard = (
+                    f"时间约束：用户问的是{target['label']}（{target['date']}）的天气，"
+                    f"必须按该日期回答；若检索内容不足以确认该日期，请明确说明不确定，"
+                    f"不要把今天天气当作{target['label']}天气。\n\n"
+                )
+
+        search_result = do_search(search_query)
         if search_result:
             user_content = (
                 f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
+                f"{weather_guard}"
                 f"{search_result}\n\n"
                 f"用户问题：{prompt}"
             )
