@@ -16,6 +16,29 @@ server {
 
     client_max_body_size 20m;
 
+    # OpenClaw API（openclaw-web 默认请求 /api/*）
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+    }
+
+    # 飞书 Webhook
+    location /feishu/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+    }
+
+    # 兜底：其余请求转发给 Caddy（再由 Caddy 路由到 openclaw）
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;

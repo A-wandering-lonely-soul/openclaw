@@ -1,6 +1,7 @@
 # OpenClaw
 
 基于 GitHub Copilot API 的 AI 聊天机器人，支持 Telegram 和飞书，通过 Docker 部署。
+也可用仓库项目openclaw-web的前端作为界面（多加个nginx代理即可），接入了实时查股票和黄金价格的接口，很适合监控股市，并且这个前端项目对数据处理做了优化，可以将数据生成为图表结构，体验比原来md文档格式更好。
 
 **主要功能：**
 - 支持多模型切换（GitHub Copilot GPT-4.1 / gpt-4o 等、DeepSeek V3 / R1）
@@ -204,6 +205,67 @@ docker ps
 ```
 
 已启用的相关容器均为 `Up` 状态即部署成功。未选择的 Telegram 或飞书容器不会出现。
+
+---
+
+## 网页前端（本地联调）
+
+项目已支持独立网页前端，前端目录位于当前仓库同级目录：`../openclaw-web`。
+
+当前版本说明：
+- 不改动现有后端逻辑与 Telegram / 飞书功能
+- 不接入当前仓库的 Docker Compose、Caddy 或 Nginx
+- 仅新增独立 Vue 前端项目，用于本地开发和网页对话
+
+### 前端能力
+
+- 单页聊天界面，无登录页
+- 多会话切换，按 `chat_id` 隔离上下文
+- 查看当前模型并切换 provider / model
+- 清空当前会话上下文
+- 本地保存会话列表与消息记录
+
+### 启动前端
+
+先启动后端：
+
+```bash
+cd ~/openclaw
+python openclaw/run_server.py
+```
+
+再启动前端：
+
+```bash
+cd ~/openclaw-web
+npm install
+npm run dev
+```
+
+默认访问地址：
+- 前端：`http://localhost:5173`
+- 后端：`http://localhost:8000`
+
+前端开发环境默认通过 Vite 代理把 `/api/*` 转发到 `http://localhost:8000`，因此不需要修改后端 CORS 配置。
+
+### 前端环境变量
+
+可参考 `../openclaw-web/.env.example`：
+
+- `VITE_API_BASE_URL=/api`
+- `VITE_API_PROXY_TARGET=http://localhost:8000`
+- `VITE_REQUEST_TIMEOUT_MS=120000`
+
+### 常见联调问题
+
+**Q: 网页发送消息时报网络错误**
+- 确认 `openclaw/run_server.py` 已启动并监听 `8000`
+- 确认前端 `.env` 中的 `VITE_API_PROXY_TARGET` 指向正确后端地址
+
+**Q: 前端能打开，但模型读取失败**
+- 检查后端 `/api/get_model` 是否可访问
+- 若后端需要的 Token 未配置，先按本文前面的部署准备补齐环境变量
+
 ---
 
 ## 使用方式
