@@ -243,7 +243,15 @@ docker ps
 - 多会话切换，按 `chat_id` 隔离上下文
 - 查看当前模型并切换 provider / model
 - 清空当前会话上下文
+- 删除单条会话时同步清理该 `chat_id` 的后端上下文
 - 本地保存会话列表与消息记录
+
+前端页面中的说明性文字已做精简（不再在界面重复展示架构说明），相关说明统一保留在文档中。
+
+### 前端静态资源（背景图）
+
+可将自定义背景图放在 `../openclaw-web/public/static/` 下，构建后可通过 `/static/*` 访问。
+例如：`../openclaw-web/public/static/anime-bg.jpg`。
 
 ### 启动前端
 
