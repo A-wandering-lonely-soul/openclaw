@@ -357,6 +357,54 @@ show_summary() {
     echo "===================================="
 }
 
+read_nginx_proxy_port() {
+    local port="${NGINX_PROXY_PORT:-}"
+    if [ -z "$port" ] && [ -f "$ENV_FILE" ] && grep -q '^NGINX_PROXY_PORT=' "$ENV_FILE"; then
+        port="$(grep '^NGINX_PROXY_PORT=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | tr -d ' ')"
+    fi
+    if [ -z "$port" ]; then
+        port="$DEFAULT_PROXY_PORT"
+    fi
+    echo "$port"
+}
+
+write_nginx_openclaw_snippet() {
+    local port="$1"
+    local out_dir="$PROJECT_DIR/nginx/generated"
+    local snippet_src="$PROJECT_DIR/nginx/openclaw-proxy-locations.snippet"
+    local out_file="$out_dir/openclaw-docker.conf"
+
+    if [ ! -f "$snippet_src" ]; then
+        echo "⚠️  未找到 $snippet_src，跳过 nginx 片段生成。"
+        return
+    fi
+
+    mkdir -p "$out_dir"
+    sed "s/__PORT__/${port}/g" "$snippet_src" > "$out_file"
+    echo "✅ 已生成 nginx 片段：$out_file"
+    echo ""
+    echo "【前置 nginx 与静态站并存时】在 443 的 server { } 内加入一行（放在 location / 之前）："
+    echo "    include /etc/nginx/snippets/openclaw-docker.conf;"
+    echo ""
+    echo "然后（若尚未复制）："
+    echo "    sudo cp $out_file /etc/nginx/snippets/openclaw-docker.conf"
+    echo "    sudo nginx -t && sudo systemctl reload nginx"
+    echo ""
+
+    if [ ! -t 0 ]; then
+        return
+    fi
+
+    if ! command_exists sudo; then
+        return
+    fi
+
+    if prompt_yes_no "是否现在将片段复制到 /etc/nginx/snippets/openclaw-docker.conf（需 sudo）？[y/N]: " "n"; then
+        sudo cp "$out_file" /etc/nginx/snippets/openclaw-docker.conf
+        echo "✅ 已复制。请在 HTTPS server 块内加入 include 后执行 nginx -t 与 reload。"
+    fi
+}
+
 setup_openclaw_box() {
     local box_script="$PROJECT_DIR/openclaw-box.sh"
     local box_link="/usr/local/bin/openclaw-box"
@@ -385,11 +433,15 @@ start_services() {
     "${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" up -d
     setup_openclaw_box
 
+    if [ "$DEPLOY_MODE" = "nginx" ]; then
+        write_nginx_openclaw_snippet "$(read_nginx_proxy_port)"
+    fi
+
     echo "===================================="
     echo "部署完成。"
     if [ "$DEPLOY_MODE" = "nginx" ]; then
-        echo "本机代理端口: 127.0.0.1:${NGINX_PROXY_PORT:-$(grep '^NGINX_PROXY_PORT=' "$ENV_FILE" | cut -d= -f2)}"
-        echo "请将前置 nginx 反代到上述端口。"
+        echo "本机代理端口: 127.0.0.1:${NGINX_PROXY_PORT:-$(grep '^NGINX_PROXY_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)}"
+        echo "请将前置 nginx 反代到上述端口；若同机还有静态站，请使用脚本生成的 nginx/generated/openclaw-docker.conf（见上方说明）。"
     else
         echo "访问地址: https://$DOMAIN"
     fi
