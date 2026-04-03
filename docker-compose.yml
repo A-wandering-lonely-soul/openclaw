@@ -10,6 +10,8 @@ services:
       - OPENAI_PROVIDER=${OPENAI_PROVIDER:-copilot}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       - openclaw_workspace:/app/workspace
     restart: always
