@@ -5,6 +5,8 @@ import time
 import hashlib
 import threading
 import requests
+import base64
+from datetime import datetime
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -14,6 +16,10 @@ APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
 ENCRYPT_KEY = os.getenv("FEISHU_ENCRYPT_KEY", "")
 OPENCLAW_URL = os.getenv("OPENCLAW_URL", "http://openclaw:8000")
+IMAGE_DIR = "/app/workspace/images"
+
+# 创建图片目录
+os.makedirs(IMAGE_DIR, exist_ok=True)
 
 FEISHU_API = "https://open.feishu.cn/open-apis"
 
@@ -110,41 +116,85 @@ def webhook():
     if event_type == "im.message.receive_v1":
         message = event.get("message", {})
         msg_type = message.get("message_type", "")
-
-        # 仅处理文本消息
-        if msg_type != "text":
-            return jsonify({"code": 0})
-
         message_id = message.get("message_id", "")
-        # 用 chat_id 隔离每个会话的历史上下文
         chat_id = f"feishu_{message.get('chat_id', message_id)}"
 
-        try:
-            content = json.loads(message.get("content", "{}"))
-            user_text = content.get("text", "").strip()
-            # 去除群里 @机器人 的 mention 标签
-            user_text = re.sub(r"@\S+", "", user_text).strip()
-        except Exception:
-            return jsonify({"code": 0})
+        # 处理文本消息
+        if msg_type == "text":
+            try:
+                content = json.loads(message.get("content", "{}"))
+                user_text = content.get("text", "").strip()
+                # 去除群里 @机器人 的 mention 标签
+                user_text = re.sub(r"@\S+", "", user_text).strip()
+            except Exception:
+                return jsonify({"code": 0})
 
-        if not user_text:
-            return jsonify({"code": 0})
+            if not user_text:
+                return jsonify({"code": 0})
 
-        # 先给用户一个状态提示，模拟“正在思考”
-        reply_to_message(message_id, "🤔 正在思考中，请稍候…")
+            reply_to_message(message_id, "🤔 正在思考中，请稍候...")
 
-        # 调用 openclaw AI 服务
-        try:
-            resp = requests.post(
-                f"{OPENCLAW_URL}/api/chat",
-                json={"prompt": user_text, "chat_id": chat_id},
-                timeout=60,
-            )
-            reply = resp.json().get("response", "抱歉，AI 暂时无法回答。")
-        except Exception as e:
-            reply = f"调用 AI 出错: {e}"
+            try:
+                resp = requests.post(
+                    f"{OPENCLAW_URL}/api/chat",
+                    json={"prompt": user_text, "chat_id": chat_id, "entry": "feishu"},
+                    timeout=60,
+                )
+                reply = resp.json().get("response", "抱歉，AI 暂时无法回答。")
+            except Exception as e:
+                reply = f"调用 AI 出错: {e}"
 
-        reply_to_message(message_id, reply)
+            reply_to_message(message_id, reply)
+
+        # 处理图片消息
+        elif msg_type == "image":
+            try:
+                content = json.loads(message.get("content", "{}"))
+                image_key = content.get("image_key", "")
+
+                if not image_key:
+                    reply_to_message(message_id, "无法获取图片")
+                    return jsonify({"code": 0})
+
+                reply_to_message(message_id, "🤔 正在分析图片，请稍候...")
+
+                token = get_tenant_access_token()
+                img_url = f"{FEISHU_API}/im/v1/messages/{message_id}/resources/{image_key}"
+                headers = {"Authorization": f"Bearer {token}"}
+
+                img_resp = requests.get(img_url, headers=headers, timeout=10)
+                if img_resp.status_code != 200:
+                    reply_to_message(message_id, "图片获取失败")
+                    return jsonify({"code": 0})
+
+                img_data = img_resp.content
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                raw_id = chat_id[7:] if chat_id.startswith("feishu_") else chat_id
+                img_filename = f"feishu_{raw_id}_{timestamp}.jpg"
+                img_path = os.path.join(IMAGE_DIR, img_filename)
+
+                with open(img_path, "wb") as fimg:
+                    fimg.write(img_data)
+
+                base64_img = base64.b64encode(img_data).decode()
+                images = [{"type": "image_jpeg", "data": base64_img, "file_path": img_filename}]
+
+                resp = requests.post(
+                    f"{OPENCLAW_URL}/api/chat",
+                    json={
+                        "prompt": "(用户发送了图片，请分析图片内容)",
+                        "chat_id": chat_id,
+                        "entry": "feishu",
+                        "images": images,
+                    },
+                    timeout=120,
+                )
+                reply = resp.json().get("response", "抱歉，AI 暂时无法回答。")
+            except Exception as e:
+                reply = f"处理图片失败: {e}"
+
+            reply_to_message(message_id, reply)
 
     return jsonify({"code": 0})
 

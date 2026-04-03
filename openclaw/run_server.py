@@ -40,14 +40,20 @@ current_config = {
 }
 
 conversation_histories = {}
+chat_id_to_entry = {}  # 映射：chat_id -> entry（用于按入口清空）
 
 # 不支持 function calling 的模型，退回纯对话模式
 TOOL_UNSUPPORTED_MODELS = {"o1-mini", "deepseek-reasoner"}
 
 WORKSPACE = "/app/workspace"
 os.makedirs(WORKSPACE, exist_ok=True)
+IMAGES_DIR = os.path.join(WORKSPACE, "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
 APP_TIMEZONE = ZoneInfo("Asia/Shanghai")
 APP_TIMEZONE_NAME = "Asia/Shanghai"
+
+# 不支持 vision 图片输入的模型
+VISION_UNSUPPORTED_MODELS = {"gpt-4.1", "o3-mini", "o1-mini", "deepseek-chat", "deepseek-reasoner"}
 
 # ─── 工具定义（OpenAI Function Calling 格式）────────────────────────────────
 
@@ -1096,6 +1102,10 @@ def chat():
 
     if chat_id not in conversation_histories:
         conversation_histories[chat_id] = []
+    
+    # 记录 chat_id 对应的 entry（用于按入口清空）
+    if entry and chat_id not in chat_id_to_entry:
+        chat_id_to_entry[chat_id] = entry
 
     history = conversation_histories[chat_id]
 
@@ -1124,9 +1134,30 @@ def chat():
                 f"用户问题：{prompt}"
             )
 
-    user_msg_idx = len(history)
-    history.append({"role": "user", "content": user_content})
+    # 处理图片（vision）
+    images = data.get("images", [])
+    vision_supported = current_config["model"] not in VISION_UNSUPPORTED_MODELS
 
+    user_msg_idx = len(history)
+    if images and vision_supported:
+        content_blocks = [{"type": "text", "text": user_content}]
+        for img in images:
+            b64 = img.get("data", "")
+            if b64:
+                content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                })
+        history.append({"role": "user", "content": content_blocks})
+    elif images and not vision_supported:
+        history.append({"role": "user", "content": user_content})
+        warn_reply = f"⚠️ 当前模型 [{current_config['model']}] 不支持图片识别，请切换到 gpt-4o 或 gpt-4o-mini 后再发图片。"
+        history.append({"role": "assistant", "content": warn_reply})
+        return jsonify({"response": warn_reply})
+    else:
+        history.append({"role": "user", "content": user_content})
+
+    restore_prompt = f"[图片] {prompt}" if images else prompt
     use_tools = current_config["model"] not in TOOL_UNSUPPORTED_MODELS
 
     try:
@@ -1142,7 +1173,7 @@ def chat():
                 messages=messages,
             )
             reply = response.choices[0].message.content or ""
-            history[user_msg_idx] = {"role": "user", "content": prompt}
+            history[user_msg_idx] = {"role": "user", "content": restore_prompt}
             history.append({"role": "assistant", "content": reply})
             return jsonify({"response": reply})
 
@@ -1191,7 +1222,7 @@ def chat():
             else:
                 # AI 返回最终文本，结束循环
                 reply = msg.content or ""
-                history[user_msg_idx] = {"role": "user", "content": prompt}
+                history[user_msg_idx] = {"role": "user", "content": restore_prompt}
                 history.append({"role": "assistant", "content": reply})
                 return jsonify({"response": reply})
 
@@ -1215,6 +1246,85 @@ def clear_context():
     else:
         conversation_histories.pop(chat_id, None)
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/images", methods=["GET"])
+def list_images():
+    """列出已保存的图片文件"""
+    try:
+        files = []
+        if os.path.isdir(IMAGES_DIR):
+            for name in sorted(os.listdir(IMAGES_DIR)):
+                fpath = os.path.join(IMAGES_DIR, name)
+                if os.path.isfile(fpath):
+                    stat = os.stat(fpath)
+                    files.append({
+                        "name": name,
+                        "size": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime, tz=APP_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+        total_size = sum(f["size"] for f in files)
+        return jsonify({"files": files, "count": len(files), "total_size": total_size})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/images/delete", methods=["POST"])
+def delete_images():
+    """删除图片：target='all' 删除所有，target='filename.jpg' 删除指定文件"""
+    data = request.json
+    target = str(data.get("target", "")).strip()
+    if not target:
+        return jsonify({"error": "target 参数不能为空"}), 400
+
+    deleted = []
+    try:
+        if target == "all":
+            if os.path.isdir(IMAGES_DIR):
+                for name in os.listdir(IMAGES_DIR):
+                    fpath = os.path.join(IMAGES_DIR, name)
+                    if os.path.isfile(fpath):
+                        os.remove(fpath)
+                        deleted.append(name)
+        else:
+            # 防止路径穿越攻击
+            safe_name = os.path.basename(target)
+            fpath = os.path.join(IMAGES_DIR, safe_name)
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+                deleted.append(safe_name)
+            else:
+                return jsonify({"error": f"文件不存在: {safe_name}"}), 404
+        return jsonify({"status": "ok", "deleted": deleted, "count": len(deleted)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/clear_context_by_entry", methods=["POST"])
+def clear_context_by_entry():
+    """按入口清空上下文：支持 web_frontend, telegram, feishu 或 all"""
+    data = request.json
+    target_entry = str(data.get("entry", "")).strip().lower()
+    
+    if not target_entry:
+        return jsonify({"error": "entry 参数不能为空"}), 400
+    
+    if target_entry == "all":
+        # 清空所有
+        conversation_histories.clear()
+        chat_id_to_entry.clear()
+        cleared_count = 0
+    elif target_entry in ["web_frontend", "telegram", "feishu"]:
+        # 清空指定入口的会话
+        to_delete = [cid for cid, ent in chat_id_to_entry.items() if ent == target_entry]
+        cleared_count = len(to_delete)
+        for cid in to_delete:
+            conversation_histories.pop(cid, None)
+            chat_id_to_entry.pop(cid, None)
+    else:
+        return jsonify({"error": f"不支持的 entry: {target_entry}，必须是 all/web_frontend/telegram/feishu"}), 400
+    
+    return jsonify({"status": "ok", "cleared_count": cleared_count, "cleared_entry": target_entry})
 
 
 @app.route("/api/set_model", methods=["POST"])

@@ -63,15 +63,17 @@ show_menu() {
     echo "=============================="
     echo " （1）清空当前会话上下文"
     echo " （2）清空所有人上下文"
-    echo " （3）重启所有服务"
-    echo " （4）停止所有服务"
-    echo " （5）启动所有服务"
-    echo " （6）查看应用日志（openclaw_service）"
-    echo " （7）查看全部容器日志"
-    echo " （8）清空日志"
-    echo " （9）切换模型"
-    echo "（10）重置配置（重新输入 Token 和域名）"
-    echo "（11）卸载（停止并移除 Docker 容器）"
+    echo " （3）按入口清空上下文（Web/Telegram/飞书）"
+    echo " （4）重启所有服务"
+    echo " （5）停止所有服务"
+    echo " （6）启动所有服务"
+    echo " （7）查看应用日志（openclaw_service）"
+    echo " （8）查看全部容器日志"
+    echo " （9）清空日志"
+    echo "（10）切换模型"
+    echo "（11）管理图片存储"
+    echo "（12）重置配置（重新输入 Token 和域名）"
+    echo "（13）卸载（停止并移除 Docker 容器）"
     echo " （0）退出"
     echo "=============================="
     echo -n "请选择: "
@@ -161,6 +163,53 @@ clear_all_context() {
     echo "✅ 已清空所有会话上下文"
 }
 
+clear_by_entry() {
+    echo ""
+    echo "--- 按入口清空上下文 ---"
+    echo " （1）清空 Web 前端会话"
+    echo " （2）清空 Telegram 会话"
+    echo " （3）清空 飞书 会话"
+    echo " （4）清空全部（Web + Telegram + 飞书）"
+    echo -n "请选择: "
+    read -r entry_choice
+    
+    local target_entry
+    case "$entry_choice" in
+        1)
+            target_entry="web_frontend"
+            echo "正在清空 Web 前端会话..."
+            ;;
+        2)
+            target_entry="telegram"
+            echo "正在清空 Telegram 会话..."
+            ;;
+        3)
+            target_entry="feishu"
+            echo "正在清空 飞书 会话..."
+            ;;
+        4)
+            target_entry="all"
+            echo "正在清空所有会话..."
+            ;;
+        *)
+            echo "❌ 无效选项"
+            return
+            ;;
+    esac
+    
+    local result
+    result=$(curl -s -X POST "$API_URL/api/clear_context_by_entry" \
+        -H "Content-Type: application/json" \
+        -d "{\"entry\": \"${target_entry}\"}")
+    
+    if echo "$result" | grep -q '"status":"ok"'; then
+        local cleared_count=$(echo "$result" | grep -o '"cleared_count":[0-9]*' | cut -d':' -f2)
+        echo "✅ 已清空 $target_entry 的会话（共清空 $cleared_count 个）"
+    else
+        echo "❌ 清空失败: $result"
+    fi
+}
+
 restart_services() {
     echo "正在重启服务..."
     mapfile -t containers < <(get_containers)
@@ -219,6 +268,83 @@ clear_logs() {
     done
 }
 
+manage_images() {
+    echo ""
+    echo "--- 图片存储管理 ---"
+    local info
+    info=$(curl -s "$API_URL/api/images")
+    if [ $? -ne 0 ] || [ -z "$info" ]; then
+        echo "❌ 无法连接到服务，请先确认服务已启动"
+        return
+    fi
+    local count total_size
+    count=$(echo "$info" | grep -o '"count":[0-9]*' | cut -d: -f2)
+    total_size=$(echo "$info" | grep -o '"total_size":[0-9]*' | cut -d: -f2)
+    count=${count:-0}
+    total_size=${total_size:-0}
+
+    # 转换大小
+    local size_str
+    if [ "$total_size" -ge 1048576 ] 2>/dev/null; then
+        size_str="$(awk "BEGIN {printf \"%.1fMB\", $total_size/1048576}")"
+    elif [ "$total_size" -ge 1024 ] 2>/dev/null; then
+        size_str="$(awk "BEGIN {printf \"%.1fKB\", $total_size/1024}")"
+    else
+        size_str="${total_size}B"
+    fi
+
+    echo "共 $count 张图片，合计 $size_str"
+    echo ""
+
+    # 显示最近10张
+    if [ "$count" -gt 0 ]; then
+        echo "最近图片："
+        echo "$info" | grep -o '"name":"[^"]*"' | head -10 | cut -d'"' -f4 | nl -w2 -s'. '
+        echo ""
+    fi
+
+    echo " （1）删除全部图片"
+    echo " （2）按文件名删除"
+    echo " （0）返回"
+    echo -n "请选择: "
+    read -r img_choice
+    case $img_choice in
+        1)
+            echo -n "确认删除全部图片？(y/N): "
+            read -r confirm
+            case "$confirm" in
+                y|Y)
+                    result=$(curl -s -X POST "$API_URL/api/images/delete" \
+                        -H "Content-Type: application/json" \
+                        -d '{"target":"all"}')
+                    del_count=$(echo "$result" | grep -o '"count":[0-9]*' | cut -d: -f2)
+                    echo "✅ 已删除 ${del_count:-0} 张图片"
+                    ;;
+                *) echo "已取消" ;;
+            esac
+            ;;
+        2)
+            echo -n "输入要删除的文件名: "
+            read -r filename
+            if [ -z "$filename" ]; then
+                echo "❌ 文件名不能为空"
+                return
+            fi
+            result=$(curl -s -X POST "$API_URL/api/images/delete" \
+                -H "Content-Type: application/json" \
+                -d "{\"target\":\"$filename\"}")
+            if echo "$result" | grep -q '"status":"ok"'; then
+                echo "✅ 已删除: $filename"
+            else
+                err=$(echo "$result" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+                echo "❌ 删除失败: ${err:-未知错误}"
+            fi
+            ;;
+        0) return ;;
+        *) echo "❌ 无效选项" ;;
+    esac
+}
+
 reset_config() {
     echo ""
     echo "⚠️  此操作将重新生成 .env 配置文件，现有配置会自动备份。"
@@ -274,15 +400,17 @@ while true; do
     case $choice in
         1) clear_current_context ;;
         2) clear_all_context ;;
-        3) restart_services ;;
-        4) stop_services ;;
-        5) start_services ;;
-        6) view_app_logs ;;
-        7) view_logs ;;
-        8) clear_logs ;;
-        9) switch_model ;;
-        10) reset_config ;;
-        11) uninstall_services ;;
+        3) clear_by_entry ;;
+        4) restart_services ;;
+        5) stop_services ;;
+        6) start_services ;;
+        7) view_app_logs ;;
+        8) view_logs ;;
+        9) clear_logs ;;
+        10) switch_model ;;
+        11) manage_images ;;
+        12) reset_config ;;
+        13) uninstall_services ;;
         0) echo "退出。"; exit 0 ;;
         *) echo "❌ 无效选项，请重新输入" ;;
     esac
