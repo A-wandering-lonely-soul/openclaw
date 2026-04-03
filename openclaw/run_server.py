@@ -1,8 +1,10 @@
 import os
 import re
 import json
+import shlex
 import subprocess
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import logging
 import requests as http_requests
 from openai import OpenAI
@@ -44,6 +46,8 @@ TOOL_UNSUPPORTED_MODELS = {"o1-mini", "deepseek-reasoner"}
 
 WORKSPACE = "/app/workspace"
 os.makedirs(WORKSPACE, exist_ok=True)
+APP_TIMEZONE = ZoneInfo("Asia/Shanghai")
+APP_TIMEZONE_NAME = "Asia/Shanghai"
 
 # ─── 工具定义（OpenAI Function Calling 格式）────────────────────────────────
 
@@ -177,6 +181,9 @@ TOOLS = [
     }
 ]
 
+WEB_FRONTEND_ENTRY = "web_frontend"
+WEB_FRONTEND_ALLOWED_TOOL_NAMES = {"schedule_task"}
+
 # ─── 工具实现 ─────────────────────────────────────────────────────────────────
 
 # 隔离环境：不将宿主机敏感环境变量传入子进程
@@ -258,7 +265,7 @@ def tool_http_get(url: str, headers: dict = None) -> str:
 
 # ─── 定时任务调度器 ───────────────────────────────────────────────────────────
 
-_scheduler = BackgroundScheduler()
+_scheduler = BackgroundScheduler(timezone=APP_TIMEZONE)
 _scheduler.start()
 TASKS_FILE = os.path.join(WORKSPACE, ".tasks.json")
 
@@ -295,19 +302,28 @@ def push_telegram_message(chat_id: str, text: str) -> bool:
 
 
 def _run_task_command(command: str, notify_chat_id: str = ""):
+    logger.info("[task] run command=%r notify_chat_id=%r", command, notify_chat_id)
     try:
         result = subprocess.run(
             command, shell=True, cwd=WORKSPACE,
             capture_output=True, text=True, timeout=120, env=_SAFE_ENV,
         )
+        output = (result.stdout or "").strip()
+        if result.stderr and result.stderr.strip():
+            output += f"\n[stderr]\n{result.stderr.strip()}"
+        if result.returncode != 0:
+            output += f"\n[exit code: {result.returncode}]"
+        logger.info("[task] done command=%r output=%r", command, output[:200])
         if notify_chat_id:
-            output = (result.stdout or "").strip()
-            if result.stderr and result.stderr.strip():
-                output += f"\n[stderr]\n{result.stderr.strip()}"
+            # notify_chat_id 必须是 Telegram 数字 chat_id 才能推送
             if output:
-                push_telegram_message(notify_chat_id, output[:4000])
+                ok = push_telegram_message(notify_chat_id, output[:4000])
+                if not ok:
+                    logger.warning("[task] push failed, notify_chat_id=%r may not be a valid Telegram ID", notify_chat_id)
+    except subprocess.TimeoutExpired:
+        logger.error("[task] command timed out command=%r", command)
     except Exception:
-        pass
+        logger.exception("[task] unexpected error command=%r", command)
 
 
 def _restore_tasks():
@@ -317,7 +333,7 @@ def _restore_tasks():
         try:
             _scheduler.add_job(
                 _run_task_command,
-                CronTrigger.from_crontab(info["cron"]),
+                CronTrigger.from_crontab(info["cron"], timezone=APP_TIMEZONE),
                 id=name,
                 args=[info["command"], info.get("notify_chat_id", "")],
                 replace_existing=True,
@@ -330,7 +346,7 @@ def tool_schedule_task(name: str, cron: str, command: str, description: str = ""
     try:
         _scheduler.add_job(
             _run_task_command,
-            CronTrigger.from_crontab(cron),
+            CronTrigger.from_crontab(cron, timezone=APP_TIMEZONE),
             id=name,
             args=[command, notify_chat_id],
             replace_existing=True,
@@ -346,6 +362,37 @@ def tool_schedule_task(name: str, cron: str, command: str, description: str = ""
         return f"创建任务失败: {e}"
 
 
+def _validate_web_schedule_command(command: str) -> tuple[bool, str]:
+    """网页前端入口的定时命令安全校验，阻止高危系统特权操作。"""
+    raw = (command or "").strip()
+    if not raw:
+        return False, "命令不能为空"
+    if len(raw) > 500:
+        return False, "命令过长"
+
+    # 禁止特权提升与系统破坏命令
+    banned_words = re.compile(
+        r"\b(sudo|su\b|chmod|chown|mkfs|mount|umount|shutdown|reboot|halt|poweroff|"
+        r"systemctl|service|apt|yum|dnf|apk|docker|podman|kubectl)\b",
+        re.IGNORECASE,
+    )
+    if banned_words.search(raw):
+        return False, "命令包含高风险系统操作，不允许通过网页入口执行"
+
+    # 禁止向工作区外写入（检测 > 或 >> 后跟绝对路径且不是工作区）
+    if re.search(r">+\s*/(?!app/workspace)", raw):
+        return False, "不允许向工作区外写入文件"
+
+    return True, ""
+
+
+def tool_schedule_task_web(name: str, cron: str, command: str, description: str = "", notify_chat_id: str = "") -> str:
+    ok, reason = _validate_web_schedule_command(command)
+    if not ok:
+        return f"创建任务失败: {reason}"
+    return tool_schedule_task(name, cron, command, description, notify_chat_id)
+
+
 def tool_list_tasks() -> str:
     tasks = _load_tasks()
     if not tasks:
@@ -353,7 +400,11 @@ def tool_list_tasks() -> str:
     lines = ["当前定时任务列表:"]
     for name, info in tasks.items():
         job = _scheduler.get_job(name)
-        next_run = str(job.next_run_time) if job and job.next_run_time else "未知"
+        if job and job.next_run_time:
+            next_run_dt = job.next_run_time.astimezone(APP_TIMEZONE)
+            next_run = f"{next_run_dt.strftime('%Y-%m-%d %H:%M:%S')} ({APP_TIMEZONE_NAME})"
+        else:
+            next_run = "未知"
         lines.append(f"\n  [{name}]")
         lines.append(f"    cron: {info['cron']}")
         lines.append(f"    命令: {info['command']}")
@@ -806,7 +857,19 @@ def tool_get_gold_price(symbol: str = "Au99.99") -> str:
     return "黄金价格查询失败：实时与历史数据源均不可用，请稍后重试。"
 
 
-def execute_tool(name: str, args: dict) -> str:
+def tools_for_entry(entry: str) -> list[dict]:
+    if entry == WEB_FRONTEND_ENTRY:
+        return [
+            t for t in TOOLS
+            if t.get("function", {}).get("name") in WEB_FRONTEND_ALLOWED_TOOL_NAMES
+        ]
+    return TOOLS
+
+
+def execute_tool(name: str, args: dict, entry: str = "") -> str:
+    if entry == WEB_FRONTEND_ENTRY and name not in WEB_FRONTEND_ALLOWED_TOOL_NAMES:
+        return "权限不足：网页入口仅允许创建定时任务。"
+
     if name == "shell_exec":
         return tool_shell_exec(args.get("command", ""), args.get("timeout", 30))
     elif name == "write_file":
@@ -816,6 +879,12 @@ def execute_tool(name: str, args: dict) -> str:
     elif name == "http_get":
         return tool_http_get(args.get("url", ""), args.get("headers", {}))
     elif name == "schedule_task":
+        if entry == WEB_FRONTEND_ENTRY:
+            return tool_schedule_task_web(
+                args.get("name", ""), args.get("cron", ""),
+                args.get("command", ""), args.get("description", ""),
+                args.get("notify_chat_id", "")
+            )
         return tool_schedule_task(
             args.get("name", ""), args.get("cron", ""),
             args.get("command", ""), args.get("description", ""),
@@ -838,11 +907,11 @@ _restore_tasks()
 
 # ─── 系统提示词（动态，含当前 chat_id）──────────────────────────────────────
 
-def build_system_prompt(chat_id: str) -> str:
-    now = datetime.now().astimezone()
+def build_system_prompt(chat_id: str, entry: str = "") -> str:
+    now = datetime.now(APP_TIMEZONE)
     now_iso = now.isoformat(timespec="seconds")
     today = now.strftime("%Y-%m-%d")
-    timezone_name = now.tzname() or "local"
+    timezone_name = APP_TIMEZONE_NAME
 
     tavily_line = (
         "- 实时搜索（后端自动）：当用户询问天气、新闻、价格等实时信息时，后端会自动用 Tavily 搜索引擎查询，"
@@ -850,33 +919,63 @@ def build_system_prompt(chat_id: str) -> str:
         "不要说'我无法联网'，也不要自行用 http_get 重复查询同一问题。"
     ) if _tavily else ""
 
+    web_mode = entry == WEB_FRONTEND_ENTRY
+
+    if web_mode:
+        execution_rule = "2. 网页入口模式下，仅可调用 schedule_task 创建定时任务。"
+        capability_lines = (
+            "- schedule_task：创建 cron 定时任务（禁止特权命令，普通命令均可）\n"
+        )
+        policy_lines = (
+            "3. 网页入口严格受限：只允许创建定时任务；禁止系统控制、禁止读写文件、禁止网络抓取。\n"
+            "4. 定时命令禁止使用 sudo/systemctl/docker 等特权命令，普通 shell 命令均可。\n"
+            "5. 网页入口无法收到推送通知，不要设置 notify_chat_id；如需在任务执行后收到通知，请通过 Telegram Bot 使用。\n"
+            "6. cron 是周期性任务，无法做到“仅执行一次”。若用户说“X 分钟后提醒”，需换算到具体时分，"
+            "告知用户任务将在该时刻及此后每天同一时刻重复触发，并询问是否接受后再创建。\n"
+            "7. 遇到错误要基于工具输出解释原因并给出可执行修正方案。\n"
+            "8. 任务完成后简洁告知用户任务名称、cron 表达式、下次执行时间（北京时间）。\n"
+            "9. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "10. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+        )
+    else:
+        execution_rule = "2. 需要运行脚本时，先用 write_file 写好，再用 shell_exec 执行。"
+        capability_lines = (
+            "- shell_exec：在 /app/workspace 目录执行 Shell 命令\n"
+            "- write_file：在工作区创建/覆盖文件\n"
+            "- read_file：读取工作区文件内容\n"
+            "- http_get：发起 HTTP GET 请求（查询公开 API、抓取数据）\n"
+            "- schedule_task：创建 cron 定时任务（服务重启后自动恢复）\n"
+            "- list_tasks：列出所有定时任务\n"
+            "- remove_task：删除定时任务\n"
+            "- get_stock_price：查询A股实时股价（支持股票代码或名称，如\"600519\"或\"贵州茅台\"）\n"
+            "- get_gold_price：查询上海金交所黄金现货价格（Au99.99 等品种）"
+        )
+        policy_lines = (
+            "3. 设置定时任务用 schedule_task，而不是直接修改 crontab。\n"
+            "4. 如果用户希望收到定时任务的执行结果，在调用 schedule_task 时将 notify_chat_id 设为 "
+            f"{chat_id}，系统会自动通过 Telegram 主动推送结果给用户。\n"
+            "5. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。\n"
+            "6. 任务完成后简洁告知用户结果和下次执行时间等关键信息。\n"
+            "7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "8. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。\n"
+            "9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。\n"
+            "10. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+        )
+
     return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
 当前用户的 chat_id 为：{chat_id}
 当前服务器时间为：{now_iso}（时区：{timezone_name}，今天日期：{today}）
 
 你拥有以下能力：
-- shell_exec：在 /app/workspace 目录执行 Shell 命令
-- write_file：在工作区创建/覆盖文件
-- read_file：读取工作区文件内容
-- http_get：发起 HTTP GET 请求（查询公开 API、抓取数据）
-- schedule_task：创建 cron 定时任务（服务重启后自动恢复）
-- list_tasks：列出所有定时任务
-- remove_task：删除定时任务
-- get_stock_price：查询A股实时股价（支持股票代码或名称，如"600519"或"贵州茅台"）
-- get_gold_price：查询上海金交所黄金现货价格（Au99.99 等品种）
+{capability_lines}
 {tavily_line}
 
 工作原则：
 1. 用户说"帮我做某事"时，直接动手执行，不要只给文字建议。
-2. 需要运行脚本时，先用 write_file 写好，再用 shell_exec 执行。
-3. 设置定时任务用 schedule_task，而不是直接修改 crontab。
-4. 如果用户希望收到定时任务的执行结果，在调用 schedule_task 时将 notify_chat_id 设为 {chat_id}，系统会自动通过 Telegram 主动推送结果给用户。
-5. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。
-6. 任务完成后简洁告知用户结果和下次执行时间等关键信息。
-7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。
-8. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。
-9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。
-10. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。
+{execution_rule}
+{policy_lines}
 
 ## 结构化输出规范（Web 前端可视化）
 
@@ -993,6 +1092,7 @@ def chat():
     data = request.json
     prompt = data.get("prompt", "")
     chat_id = str(data.get("chat_id", "default"))
+    entry = str(data.get("entry", "")).strip()
 
     if chat_id not in conversation_histories:
         conversation_histories[chat_id] = []
@@ -1031,8 +1131,9 @@ def chat():
 
     try:
         client = get_client()
-        system_prompt = build_system_prompt(chat_id)
+        system_prompt = build_system_prompt(chat_id, entry)
         messages = [{"role": "system", "content": system_prompt}] + history
+        available_tools = tools_for_entry(entry)
 
         if not use_tools:
             # 不支持工具的模型，退回纯对话
@@ -1051,7 +1152,7 @@ def chat():
             response = client.chat.completions.create(
                 model=current_config["model"],
                 messages=messages,
-                tools=TOOLS,
+                tools=available_tools,
                 tool_choice="auto",
             )
             msg = response.choices[0].message
@@ -1081,7 +1182,7 @@ def chat():
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         args = {}
-                    result = execute_tool(tc.function.name, args)
+                    result = execute_tool(tc.function.name, args, entry)
                     history.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
