@@ -39,7 +39,7 @@ async def _typing_indicator(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = (update.message.text or "").strip()
+    user_text = (update.message.text or update.message.caption or "").strip()
     chat_id = str(update.effective_chat.id)
     images = []
 
