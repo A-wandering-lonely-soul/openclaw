@@ -98,6 +98,10 @@ switch_model() {
             echo " （3）gpt-4o-mini    GPT-4o Mini（轻量）"
             echo " （4）o3-mini        o3 Mini（推理）"
             echo " （5）o1-mini        o1 Mini（推理）"
+            echo " （6）claude-opus-4.6    Claude Opus 4.6"
+            echo " （7）claude-sonnet-4.6  Claude Sonnet 4.6"
+            echo " （8）gpt-5.3-codex      GPT-5.3-Codex"
+            echo " （9）gemini-3.1-pro     Gemini 3.1 Pro"
             echo -n "请选择: "
             read -r model_choice
             case $model_choice in
@@ -106,6 +110,10 @@ switch_model() {
                 3) model="gpt-4o-mini" ;;
                 4) model="o3-mini" ;;
                 5) model="o1-mini" ;;
+                6) model="claude-opus-4.6" ;;
+                7) model="claude-sonnet-4.6" ;;
+                8) model="gpt-5.3-codex" ;;
+                9) model="gemini-3.1-pro" ;;
                 *) echo "❌ 无效选项"; return ;;
             esac
             ;;
