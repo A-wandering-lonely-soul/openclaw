@@ -955,7 +955,8 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "- list_tasks：列出所有定时任务\n"
             "- remove_task：删除定时任务\n"
             "- get_stock_price：查询A股实时股价（支持股票代码或名称，如\"600519\"或\"贵州茅台\"）\n"
-            "- get_gold_price：查询上海金交所黄金现货价格（Au99.99 等品种）"
+            "- get_gold_price：查询上海金交所黄金现货价格（Au99.99 等品种）\n"
+            "- 图片识别（vision）：用户发送图片时，图片内容会直接附在消息中，你可以直接分析和描述图片内容。"
         )
         policy_lines = (
             "3. 设置定时任务用 schedule_task，而不是直接修改 crontab。\n"
