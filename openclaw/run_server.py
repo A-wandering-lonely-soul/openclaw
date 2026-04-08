@@ -31,6 +31,11 @@ PROVIDERS = {
     "deepseek": {
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
+    },
+    "ollama": {
+        "base_url": os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"),
+        "api_key_env": "OLLAMA_API_KEY",
+        "default_api_key": "ollama",
     }
 }
 
@@ -1086,8 +1091,13 @@ def do_search(query: str) -> str:
 
 def get_client():
     provider = PROVIDERS[current_config["provider"]]
+    api_key = os.getenv(provider.get("api_key_env", ""), "")
+    if not api_key:
+        api_key = provider.get("default_api_key", "")
+    if not api_key:
+        api_key = "dummy"
     return OpenAI(
-        api_key=os.getenv(provider["api_key_env"]),
+        api_key=api_key,
         base_url=provider["base_url"]
     )
 

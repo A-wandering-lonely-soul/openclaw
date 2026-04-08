@@ -14,6 +14,8 @@ OPENAI_PROVIDER=""
 OPENAI_MODEL=""
 GITHUB_TOKEN=""
 DEEPSEEK_API_KEY=""
+OLLAMA_API_KEY=""
+OLLAMA_BASE_URL=""
 TAVILY_API_KEY=""
 TUSHARE_TOKEN=""
 TELEGRAM_BOT_TOKEN=""
@@ -177,9 +179,10 @@ choose_ai_provider() {
     echo "请选择默认 AI 提供商："
     echo "  1) GitHub Copilot"
     echo "  2) DeepSeek"
+    echo "  3) Ollama"
 
     while true; do
-        read -rp "输入 1 或 2（默认 1）: " provider_choice
+        read -rp "输入 1/2/3（默认 1）: " provider_choice
         provider_choice="${provider_choice:-1}"
         case "$provider_choice" in
             1)
@@ -220,6 +223,34 @@ choose_ai_provider() {
                     esac
                 done
                 prompt_value DEEPSEEK_API_KEY "请输入 DEEPSEEK_API_KEY: " "" 1 0
+                return
+                ;;
+            3)
+                OPENAI_PROVIDER="ollama"
+                echo "请选择默认 Ollama 模型："
+                echo "  1) llama3.1:8b"
+                echo "  2) qwen2.5:7b-instruct"
+                echo "  3) gemma3:12b"
+                echo "  4) 自定义输入"
+                while true; do
+                    read -rp "输入 1-4（默认 1）: " model_choice
+                    model_choice="${model_choice:-1}"
+                    case "$model_choice" in
+                        1) OPENAI_MODEL="llama3.1:8b" ; break ;;
+                        2) OPENAI_MODEL="qwen2.5:7b-instruct" ; break ;;
+                        3) OPENAI_MODEL="gemma3:12b" ; break ;;
+                        4)
+                            read -rp "输入 Ollama 模型名（如 llama3.1:8b）: " OPENAI_MODEL
+                            if [ -n "$OPENAI_MODEL" ]; then
+                                break
+                            fi
+                            echo "模型名不能为空。"
+                            ;;
+                        *) echo "请输入有效选项。" ;;
+                    esac
+                done
+                prompt_value OLLAMA_BASE_URL "请输入 OLLAMA_BASE_URL（默认 http://host.docker.internal:11434/v1）: " "http://host.docker.internal:11434/v1" 0 0
+                prompt_value OLLAMA_API_KEY "请输入 OLLAMA_API_KEY（无可留空）: " "" 0 1
                 return
                 ;;
             *) echo "请输入有效选项。" ;;
@@ -268,6 +299,8 @@ write_env_file() {
         printf "OPENAI_MODEL=%s\n" "$OPENAI_MODEL"
         printf "GITHUB_TOKEN=%s\n" "$GITHUB_TOKEN"
         printf "DEEPSEEK_API_KEY=%s\n" "$DEEPSEEK_API_KEY"
+        printf "OLLAMA_API_KEY=%s\n" "$OLLAMA_API_KEY"
+        printf "OLLAMA_BASE_URL=%s\n" "$OLLAMA_BASE_URL"
         printf "TAVILY_API_KEY=%s\n" "$TAVILY_API_KEY"
         printf "TUSHARE_TOKEN=%s\n" "$TUSHARE_TOKEN"
         printf "TELEGRAM_BOT_TOKEN=%s\n" "$TELEGRAM_BOT_TOKEN"

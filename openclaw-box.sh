@@ -84,6 +84,7 @@ switch_model() {
     echo "--- 选择服务提供商 ---"
     echo " （1）GitHub Copilot"
     echo " （2）DeepSeek"
+    echo " （3）Ollama"
     echo -n "请选择: "
     read -r provider_choice
 
@@ -128,6 +129,31 @@ switch_model() {
             case $model_choice in
                 1) model="deepseek-chat" ;;
                 2) model="deepseek-reasoner" ;;
+                *) echo "❌ 无效选项"; return ;;
+            esac
+            ;;
+        3)
+            provider="ollama"
+            echo ""
+            echo "--- Ollama 模型 ---"
+            echo " （1）llama3.1:8b"
+            echo " （2）qwen2.5:7b-instruct"
+            echo " （3）gemma3:12b"
+            echo " （4）自定义输入"
+            echo -n "请选择: "
+            read -r model_choice
+            case $model_choice in
+                1) model="llama3.1:8b" ;;
+                2) model="qwen2.5:7b-instruct" ;;
+                3) model="gemma3:12b" ;;
+                4)
+                    echo -n "输入 ollama 模型名（如 llama3.1:8b）: "
+                    read -r model
+                    if [ -z "$model" ]; then
+                        echo "❌ 模型名不能为空"
+                        return
+                    fi
+                    ;;
                 *) echo "❌ 无效选项"; return ;;
             esac
             ;;
