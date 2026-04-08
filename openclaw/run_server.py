@@ -49,6 +49,7 @@ chat_id_to_entry = {}  # 映射：chat_id -> entry（用于按入口清空）
 
 # 不支持 function calling 的模型，退回纯对话模式
 TOOL_UNSUPPORTED_MODELS = {"o1-mini", "deepseek-reasoner"}
+TOOL_UNSUPPORTED_PROVIDERS = {"ollama"}
 
 WORKSPACE = "/app/workspace"
 os.makedirs(WORKSPACE, exist_ok=True)
@@ -1169,7 +1170,10 @@ def chat():
         history.append({"role": "user", "content": user_content})
 
     restore_prompt = f"[图片] {prompt}" if images else prompt
-    use_tools = current_config["model"] not in TOOL_UNSUPPORTED_MODELS
+    use_tools = (
+        current_config["provider"] not in TOOL_UNSUPPORTED_PROVIDERS
+        and current_config["model"] not in TOOL_UNSUPPORTED_MODELS
+    )
 
     try:
         client = get_client()

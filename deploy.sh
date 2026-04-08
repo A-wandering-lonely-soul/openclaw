@@ -228,18 +228,22 @@ choose_ai_provider() {
             3)
                 OPENAI_PROVIDER="ollama"
                 echo "请选择默认 Ollama 模型："
-                echo "  1) llama3.1:8b"
-                echo "  2) qwen2.5:7b-instruct"
-                echo "  3) gemma3:12b"
-                echo "  4) 自定义输入"
+                echo "  1) llama3.2:3b"
+                echo "  2) qwen2.5:3b"
+                echo "  3) llama3.1:8b"
+                echo "  4) qwen2.5:7b-instruct"
+                echo "  5) gemma3:12b"
+                echo "  6) 自定义输入"
                 while true; do
-                    read -rp "输入 1-4（默认 1）: " model_choice
+                    read -rp "输入 1-6（默认 1）: " model_choice
                     model_choice="${model_choice:-1}"
                     case "$model_choice" in
-                        1) OPENAI_MODEL="llama3.1:8b" ; break ;;
-                        2) OPENAI_MODEL="qwen2.5:7b-instruct" ; break ;;
-                        3) OPENAI_MODEL="gemma3:12b" ; break ;;
-                        4)
+                        1) OPENAI_MODEL="llama3.2:3b" ; break ;;
+                        2) OPENAI_MODEL="qwen2.5:3b" ; break ;;
+                        3) OPENAI_MODEL="llama3.1:8b" ; break ;;
+                        4) OPENAI_MODEL="qwen2.5:7b-instruct" ; break ;;
+                        5) OPENAI_MODEL="gemma3:12b" ; break ;;
+                        6)
                             read -rp "输入 Ollama 模型名（如 llama3.1:8b）: " OPENAI_MODEL
                             if [ -n "$OPENAI_MODEL" ]; then
                                 break
@@ -249,6 +253,22 @@ choose_ai_provider() {
                         *) echo "请输入有效选项。" ;;
                     esac
                 done
+
+                echo ""
+                echo "⚠️  你选择了 Ollama 模型，请确认服务器已完成以下准备："
+                echo "  1) 安装 Ollama：curl -fsSL https://ollama.com/install.sh | sh"
+                echo "  2) 启动服务：sudo systemctl enable --now ollama"
+                echo "  3) 拉取模型：ollama pull $OPENAI_MODEL"
+
+                if ! command_exists ollama; then
+                    echo ""
+                    echo "⚠️  当前系统未检测到 ollama 命令。"
+                    if ! prompt_yes_no "仍然继续部署？[y/N]: " "n"; then
+                        echo "已取消，请先安装并准备 Ollama 后重试。"
+                        exit 1
+                    fi
+                fi
+
                 prompt_value OLLAMA_BASE_URL "请输入 OLLAMA_BASE_URL（默认 http://host.docker.internal:11434/v1）: " "http://host.docker.internal:11434/v1" 0 0
                 prompt_value OLLAMA_API_KEY "请输入 OLLAMA_API_KEY（无可留空）: " "" 0 1
                 return

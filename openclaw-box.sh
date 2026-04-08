@@ -136,17 +136,21 @@ switch_model() {
             provider="ollama"
             echo ""
             echo "--- Ollama 模型 ---"
-            echo " （1）llama3.1:8b"
-            echo " （2）qwen2.5:7b-instruct"
-            echo " （3）gemma3:12b"
-            echo " （4）自定义输入"
+            echo " （1）llama3.2:3b"
+            echo " （2）qwen2.5:3b"
+            echo " （3）llama3.1:8b"
+            echo " （4）qwen2.5:7b-instruct"
+            echo " （5）gemma3:12b"
+            echo " （6）自定义输入"
             echo -n "请选择: "
             read -r model_choice
             case $model_choice in
-                1) model="llama3.1:8b" ;;
-                2) model="qwen2.5:7b-instruct" ;;
-                3) model="gemma3:12b" ;;
-                4)
+                1) model="llama3.2:3b" ;;
+                2) model="qwen2.5:3b" ;;
+                3) model="llama3.1:8b" ;;
+                4) model="qwen2.5:7b-instruct" ;;
+                5) model="gemma3:12b" ;;
+                6)
                     echo -n "输入 ollama 模型名（如 llama3.1:8b）: "
                     read -r model
                     if [ -z "$model" ]; then
