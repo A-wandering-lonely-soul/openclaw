@@ -135,12 +135,12 @@ switch_model() {
         3)
             provider="ollama"
             echo ""
-            echo "--- Ollama 模型 ---"
-            echo " （1）llama3.2:3b"
-            echo " （2）qwen2.5:3b"
-            echo " （3）llama3.1:8b"
-            echo " （4）qwen2.5:7b-instruct"
-            echo " （5）gemma3:12b"
+            echo "--- Ollama 模型（实验功能 / 低配机器仅推荐 3B）---"
+            echo " （1）llama3.2:3b         推荐"
+            echo " （2）qwen2.5:3b         推荐"
+            echo " （3）llama3.1:8b        重型，低配易超时"
+            echo " （4）qwen2.5:7b-instruct 重型，低配易超时"
+            echo " （5）gemma3:12b         重型，低配不推荐"
             echo " （6）自定义输入"
             echo -n "请选择: "
             read -r model_choice
@@ -159,6 +159,13 @@ switch_model() {
                     fi
                     ;;
                 *) echo "❌ 无效选项"; return ;;
+            esac
+
+            case "$model" in
+                llama3.1:8b|qwen2.5:7b-instruct|gemma3:12b)
+                    echo "⚠️  当前 Ollama 模型属于重型模型。2核/8G 这类低配 CPU 服务器上容易出现高负载、超时或 504。"
+                    echo "   建议优先使用 llama3.2:3b 或 qwen2.5:3b。"
+                    ;;
             esac
             ;;
         *)

@@ -47,6 +47,9 @@ current_config = {
 conversation_histories = {}
 chat_id_to_entry = {}  # 映射：chat_id -> entry（用于按入口清空）
 
+OLLAMA_HEAVY_MODELS = {"llama3.1:8b", "qwen2.5:7b-instruct", "gemma3:12b"}
+OLLAMA_RECOMMENDED_MODELS = {"llama3.2:3b", "qwen2.5:3b"}
+
 # 不支持 function calling 的模型，退回纯对话模式
 TOOL_UNSUPPORTED_MODELS = {"o1-mini", "deepseek-reasoner"}
 TOOL_UNSUPPORTED_PROVIDERS = {"ollama"}
@@ -924,12 +927,13 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
     now_iso = now.isoformat(timespec="seconds")
     today = now.strftime("%Y-%m-%d")
     timezone_name = APP_TIMEZONE_NAME
+    ollama_mode = current_config["provider"] == "ollama"
 
     tavily_line = (
         "- 实时搜索（后端自动）：当用户询问天气、新闻、价格等实时信息时，后端会自动用 Tavily 搜索引擎查询，"
         "并将搜索结果注入到用户消息的开头。你只需直接基于这些已注入的内容回答，"
         "不要说'我无法联网'，也不要自行用 http_get 重复查询同一问题。"
-    ) if _tavily else ""
+    ) if _tavily and not ollama_mode else ""
 
     web_mode = entry == WEB_FRONTEND_ENTRY
 
@@ -976,6 +980,12 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "10. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
             "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
+
+        if ollama_mode:
+            policy_lines += (
+                "\n12. 当前使用的是 Ollama 本地模型：优先给出简洁、直接、短一些的回答；除非用户明确要求，不要输出过长分析。"
+                "\n13. 不要假设自己具备联网/复杂工具能力；本地模型场景下以纯对话回答为主。"
+            )
 
     return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
 当前用户的 chat_id 为：{chat_id}
@@ -1121,9 +1131,11 @@ def chat():
 
     history = conversation_histories[chat_id]
 
+    ollama_mode = current_config["provider"] == "ollama"
+
     # 联网搜索增强
     user_content = prompt
-    if needs_search(prompt) and not is_market_quote_query(prompt):
+    if not ollama_mode and needs_search(prompt) and not is_market_quote_query(prompt):
         search_query = prompt
         weather_guard = ""
 
@@ -1149,6 +1161,16 @@ def chat():
     # 处理图片（vision）
     images = data.get("images", [])
     vision_supported = current_config["model"] not in VISION_UNSUPPORTED_MODELS
+
+    if ollama_mode and current_config["model"] in OLLAMA_HEAVY_MODELS:
+        high_risk_request = len(prompt) > 200 or bool(images) or needs_search(prompt)
+        if high_risk_request:
+            warn_reply = (
+                f"⚠️ 当前 Ollama 模型 [{current_config['model']}] 属于重型模型，在低配 CPU 服务器上很容易超时或占满资源。"
+                "建议切换到 qwen2.5:3b 或 llama3.2:3b 后再试；如需复杂/联网任务，也建议改用 Copilot。"
+            )
+            history.append({"role": "assistant", "content": warn_reply})
+            return jsonify({"response": warn_reply})
 
     user_msg_idx = len(history)
     if images and vision_supported:
