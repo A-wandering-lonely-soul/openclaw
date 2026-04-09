@@ -1200,6 +1200,7 @@ def chat():
     prompt = data.get("prompt", "")
     chat_id = str(data.get("chat_id", "default"))
     entry = str(data.get("entry", "")).strip()
+    logger.info(f"[CHAT] prompt='{prompt[:80]}' provider={current_config['provider']} model={current_config['model']}")
 
     if chat_id not in conversation_histories:
         conversation_histories[chat_id] = []
@@ -1215,27 +1216,34 @@ def chat():
 
     # 联网搜索增强
     user_content = prompt
+    logger.info(f"[SEARCH] _tavily={_tavily is not None} needs_search={needs_search(prompt)} is_market={is_market_quote_query(prompt)}")
     if needs_search(prompt) and not is_market_quote_query(prompt):
+        logger.info(f"[SEARCH] Condition passed, searching for: '{prompt}'")
         search_query = prompt
         weather_guard = ""
 
         if is_weather_query(prompt):
             target = resolve_weather_target_date(prompt)
+            logger.info(f"[SEARCH] is_weather=True target={target}")
             if target:
                 search_query = f"{prompt} {target['date']} 天气预报"
                 weather_guard = (
                     f"时间约束：用户问的是{target['label']}（{target['date']}）的天气，"
                     f"必须按该日期回答；若检索内容不足以确认该日期，请明确说明不确定，"
                     f"不要把今天天气当作{target['label']}天气。\n\n"
-                )
-
-        if ollama_mode:
+            downgrade_reason = None
             if should_downgrade_ollama_search(prompt, history, images):
-                logger.info("Ollama search downgraded: skip web search for stability")
+                downgrade_reason = f"prompt_len={len(prompt)} history_len={len(history)} heavy_model={current_config['model'] in OLLAMA_HEAVY_MODELS}"
+                logger.info(f"[OLLAMA_SEARCH] DOWNGRADED: {downgrade_reason}")
             else:
+                logger.info(f"[OLLAMA_SEARCH] PROCEED WITH SEARCH for '{search_query}'")
                 search_result = do_search(
                     search_query,
                     max_results=max(1, OLLAMA_SEARCH_MAX_RESULTS),
+                    max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
+                    total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
+                )
+                logger.info(f"[OLLAMA_SEARCH] Got result length={len(search_result) if search_result else 0}"    max_results=max(1, OLLAMA_SEARCH_MAX_RESULTS),
                     max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
                     total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
                 )
