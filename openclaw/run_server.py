@@ -1104,9 +1104,19 @@ def resolve_weather_target_date(text: str):
 
 
 def build_weather_fallback_query(text: str) -> str:
-    city_match = re.search(r"([\u4e00-\u9fa5]{2,8})(?:市)?", text)
+    text_norm = re.sub(r"[？?，。,.!！：:；;、\s]+", "", text)
+
+    # Prefer explicit admin-area suffixes first, e.g. 北京市/广州市/朝阳区.
+    city_match = re.search(r"([\u4e00-\u9fa5]{2,10}(?:市|区|县|州|盟))", text_norm)
+    if not city_match:
+        # Fallback: capture the city token before time/weather keywords.
+        city_match = re.search(
+            r"([\u4e00-\u9fa5]{2,6})(?=(?:大后天|后天|明天|今天|今日|天气|气温|温度|下雨|降雨|风力|空气质量|预报))",
+            text_norm,
+        )
+
     if city_match:
-        city = city_match.group(1)
+        city = city_match.group(1).rstrip("的")
         return f"{city} 天气 预报"
     return "中国 天气 预报"
 
