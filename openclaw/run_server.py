@@ -1231,10 +1231,14 @@ def chat():
                     f"时间约束：用户问的是{target['label']}（{target['date']}）的天气，"
                     f"必须按该日期回答；若检索内容不足以确认该日期，请明确说明不确定，"
                     f"不要把今天天气当作{target['label']}天气。\n\n"
-            downgrade_reason = None
+                )
+
+        if ollama_mode:
             if should_downgrade_ollama_search(prompt, history, images):
-                downgrade_reason = f"prompt_len={len(prompt)} history_len={len(history)} heavy_model={current_config['model'] in OLLAMA_HEAVY_MODELS}"
-                logger.info(f"[OLLAMA_SEARCH] DOWNGRADED: {downgrade_reason}")
+                logger.info(
+                    f"[OLLAMA_SEARCH] DOWNGRADED: prompt_len={len(prompt)} "
+                    f"history_len={len(history)} heavy_model={current_config['model'] in OLLAMA_HEAVY_MODELS}"
+                )
             else:
                 logger.info(f"[OLLAMA_SEARCH] PROCEED WITH SEARCH for '{search_query}'")
                 search_result = do_search(
@@ -1243,10 +1247,7 @@ def chat():
                     max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
                     total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
                 )
-                logger.info(f"[OLLAMA_SEARCH] Got result length={len(search_result) if search_result else 0}"    max_results=max(1, OLLAMA_SEARCH_MAX_RESULTS),
-                    max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
-                    total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
-                )
+                logger.info(f"[OLLAMA_SEARCH] Got result length={len(search_result) if search_result else 0}")
                 if search_result:
                     user_content = (
                         f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
