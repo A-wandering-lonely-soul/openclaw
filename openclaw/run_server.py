@@ -48,7 +48,11 @@ conversation_histories = {}
 chat_id_to_entry = {}  # 映射：chat_id -> entry（用于按入口清空）
 
 OLLAMA_HEAVY_MODELS = {"llama3.1:8b", "qwen2.5:7b-instruct", "gemma3:12b"}
-OLLAMA_RECOMMENDED_MODELS = {"llama3.2:3b", "qwen2.5:3b"}
+OLLAMA_RECOMMENDED_MODELS = {"qwen2.5:3b"}
+
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "256"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
 
 # 不支持 function calling 的模型，退回纯对话模式
 TOOL_UNSUPPORTED_MODELS = {"o1-mini", "deepseek-reasoner"}
@@ -1107,10 +1111,37 @@ def get_client():
         api_key = provider.get("default_api_key", "")
     if not api_key:
         api_key = "dummy"
+    if current_config["provider"] == "ollama":
+        return OpenAI(
+            api_key=api_key,
+            base_url=provider["base_url"],
+            timeout=OLLAMA_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
     return OpenAI(
         api_key=api_key,
         base_url=provider["base_url"]
     )
+
+
+def get_ollama_tags_url() -> str:
+    base_url = PROVIDERS["ollama"]["base_url"].rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return f"{base_url}/api/tags"
+
+
+def fetch_ollama_models() -> set[str]:
+    tags_url = get_ollama_tags_url()
+    resp = http_requests.get(tags_url, timeout=5)
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    models = set()
+    for item in data.get("models", []):
+        name = str(item.get("name", "")).strip()
+        if name:
+            models.add(name)
+    return models
 
 
 # ─── API 路由 ─────────────────────────────────────────────────────────────────
@@ -1167,7 +1198,7 @@ def chat():
         if high_risk_request:
             warn_reply = (
                 f"⚠️ 当前 Ollama 模型 [{current_config['model']}] 属于重型模型，在低配 CPU 服务器上很容易超时或占满资源。"
-                "建议切换到 qwen2.5:3b 或 llama3.2:3b 后再试；如需复杂/联网任务，也建议改用 Copilot。"
+                "建议切换到 qwen2.5:3b 后再试（如需 llama3.2:3b 请先手动 ollama pull）；复杂/联网任务也建议改用 Copilot。"
             )
             history.append({"role": "assistant", "content": warn_reply})
             return jsonify({"response": warn_reply})
@@ -1205,10 +1236,14 @@ def chat():
 
         if not use_tools:
             # 不支持工具的模型，退回纯对话
-            response = client.chat.completions.create(
-                model=current_config["model"],
-                messages=messages,
-            )
+            request_args = {
+                "model": current_config["model"],
+                "messages": messages,
+            }
+            if ollama_mode:
+                request_args["max_tokens"] = OLLAMA_MAX_TOKENS
+                request_args["temperature"] = OLLAMA_TEMPERATURE
+            response = client.chat.completions.create(**request_args)
             reply = response.choices[0].message.content or ""
             history[user_msg_idx] = {"role": "user", "content": restore_prompt}
             history.append({"role": "assistant", "content": reply})
@@ -1217,12 +1252,16 @@ def chat():
         # Agent 循环：最多 10 轮工具调用
         for _ in range(10):
             messages = [{"role": "system", "content": system_prompt}] + history
-            response = client.chat.completions.create(
-                model=current_config["model"],
-                messages=messages,
-                tools=available_tools,
-                tool_choice="auto",
-            )
+            request_args = {
+                "model": current_config["model"],
+                "messages": messages,
+                "tools": available_tools,
+                "tool_choice": "auto",
+            }
+            if ollama_mode:
+                request_args["max_tokens"] = OLLAMA_MAX_TOKENS
+                request_args["temperature"] = OLLAMA_TEMPERATURE
+            response = client.chat.completions.create(**request_args)
             msg = response.choices[0].message
 
             if msg.tool_calls:
@@ -1371,6 +1410,17 @@ def set_model():
     model = data.get("model", "gpt-4.1")
     if provider not in PROVIDERS:
         return jsonify({"status": "error", "message": f"未知 provider: {provider}"}), 400
+    if provider == "ollama":
+        try:
+            available_models = fetch_ollama_models()
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"无法连接 Ollama 服务，请检查 OLLAMA_BASE_URL 与 ollama 服务状态: {e}"}), 400
+        if available_models and model not in available_models:
+            preview = sorted(available_models)
+            return jsonify({
+                "status": "error",
+                "message": f"Ollama 模型不存在: {model}。可用模型: {', '.join(preview)}。请先执行 ollama pull {model}。"
+            }), 400
     current_config["provider"] = provider
     current_config["model"] = model
     return jsonify({"status": "ok", "provider": provider, "model": model})

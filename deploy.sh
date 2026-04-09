@@ -228,21 +228,21 @@ choose_ai_provider() {
             3)
                 OPENAI_PROVIDER="ollama"
                 echo "请选择默认 Ollama 模型："
-                echo "  1) llama3.2:3b"
-                echo "  2) qwen2.5:3b"
-                echo "  3) llama3.1:8b"
-                echo "  4) qwen2.5:7b-instruct"
-                echo "  5) gemma3:12b"
+                echo "  1) qwen2.5:3b"
+                echo "  2) llama3.1:8b"
+                echo "  3) qwen2.5:7b-instruct"
+                echo "  4) gemma3:12b"
+                echo "  5) llama3.2:3b（需先手动 pull）"
                 echo "  6) 自定义输入"
                 while true; do
                     read -rp "输入 1-6（默认 1）: " model_choice
                     model_choice="${model_choice:-1}"
                     case "$model_choice" in
-                        1) OPENAI_MODEL="llama3.2:3b" ; break ;;
-                        2) OPENAI_MODEL="qwen2.5:3b" ; break ;;
-                        3) OPENAI_MODEL="llama3.1:8b" ; break ;;
-                        4) OPENAI_MODEL="qwen2.5:7b-instruct" ; break ;;
-                        5) OPENAI_MODEL="gemma3:12b" ; break ;;
+                        1) OPENAI_MODEL="qwen2.5:3b" ; break ;;
+                        2) OPENAI_MODEL="llama3.1:8b" ; break ;;
+                        3) OPENAI_MODEL="qwen2.5:7b-instruct" ; break ;;
+                        4) OPENAI_MODEL="gemma3:12b" ; break ;;
+                        5) OPENAI_MODEL="llama3.2:3b" ; break ;;
                         6)
                             read -rp "输入 Ollama 模型名（如 llama3.1:8b）: " OPENAI_MODEL
                             if [ -n "$OPENAI_MODEL" ]; then
