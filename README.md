@@ -7,7 +7,7 @@
 - 支持多模型切换（GitHub Copilot GPT-4.1 / gpt-4o 等、DeepSeek V3 / R1）
 - 自动联网搜索（Tavily），问到实时信息时自动查询
 - A股行情多通道查询（Tushare Pro 优先，失败自动切换 AKShare/东方财富/腾讯兜底）
-- 保留对话历史上下文，支持多用户并发
+- 聊天上下文采用 Redis（热缓存）+ PostgreSQL（持久化）
 - 支持 Telegram Bot 和飞书机器人双渠道接入
 - 服务器管理面板 `openclaw-box`
 
@@ -146,6 +146,15 @@ chmod +x deploy.sh
 
 `.env` 模板可参考 [.env.example](.env.example)。
 
+会话存储相关环境变量：
+- `REDIS_URL`：Redis 连接串，默认 `redis://redis:6379/0`
+- `REDIS_CHAT_TTL_SECONDS`：Redis 会话缓存 TTL，默认 `604800`（7 天）
+- `POSTGRES_DSN`：PostgreSQL 连接串，默认 `postgresql://openclaw:openclaw@postgres:5432/openclaw`
+
+说明：
+- `/api/chat` 会把新消息同时写入 PostgreSQL，并写入 Redis 缓存。
+- `/api/clear_context` 与 `/api/clear_context_by_entry` 会同时清理 PostgreSQL 与 Redis，行为与旧版保持一致（但不再依赖进程内存）。
+
 > ⚠️ `.env` 已加入 `.gitignore`，不会被提交到 git，请勿手动分享此文件内容。
 > ⚠️ 不要把 Token 粘贴到任何聊天窗口，包括和 AI 的对话。
 
@@ -242,6 +251,9 @@ docker ps
 - 单页聊天界面，无登录页
 - 多会话切换，按 `chat_id` 隔离上下文
 - 查看当前模型并切换 provider / model
+- 支持在 Web 端切换 provider：copilot / deepseek / ollama
+- Ollama 在 Web 端默认仅展示低配推荐模型 `qwen2.5:3b`
+- 若后端当前为 Ollama 重型模型，Web 端仅显示并禁用该选项，避免误选导致高负载/超时
 - 清空当前会话上下文
 - 删除单条会话时同步清理该 `chat_id` 的后端上下文
 - 本地保存会话列表与消息记录

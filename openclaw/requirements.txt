@@ -5,3 +5,5 @@ requests
 apscheduler
 akshare
 tushare
+redis
+psycopg2-binary

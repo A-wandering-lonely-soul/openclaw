@@ -3,10 +3,14 @@ import re
 import json
 import shlex
 import subprocess
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 import requests as http_requests
+import redis
+import psycopg2
+from psycopg2.extras import Json
 from openai import OpenAI
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -44,8 +48,12 @@ current_config = {
     "model": os.getenv("OPENAI_MODEL", "gpt-4.1")
 }
 
-conversation_histories = {}
-chat_id_to_entry = {}  # 映射：chat_id -> entry（用于按入口清空）
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+REDIS_CHAT_TTL_SECONDS = int(os.getenv("REDIS_CHAT_TTL_SECONDS", "604800"))
+POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://openclaw:openclaw@postgres:5432/openclaw")
+
+redis_client = None
+pg_conn = None
 
 OLLAMA_HEAVY_MODELS = {"llama3.1:8b", "qwen2.5:7b-instruct", "gemma3:12b"}
 OLLAMA_RECOMMENDED_MODELS = {"qwen2.5:3b"}
@@ -73,6 +81,199 @@ APP_TIMEZONE_NAME = "Asia/Shanghai"
 
 # 不支持 vision 图片输入的模型
 VISION_UNSUPPORTED_MODELS = {"gpt-4.1", "o3-mini", "o1-mini", "deepseek-chat", "deepseek-reasoner"}
+
+
+def redis_history_key(chat_id: str) -> str:
+    return f"openclaw:chat:history:{chat_id}"
+
+
+def get_pg_conn():
+    global pg_conn
+    if pg_conn is None or pg_conn.closed:
+        pg_conn = psycopg2.connect(POSTGRES_DSN)
+        pg_conn.autocommit = True
+    return pg_conn
+
+
+def init_storage():
+    global redis_client
+
+    # Redis: 会话热缓存
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+
+    # PostgreSQL: 持久化会话与消息
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                chat_id TEXT PRIMARY KEY,
+                entry TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content JSONB NOT NULL,
+                tool_calls JSONB,
+                tool_call_id TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id_id
+            ON chat_messages(chat_id, id)
+            """
+        )
+
+
+def init_storage_with_retry(max_attempts: int = 20, delay_seconds: float = 1.5):
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            init_storage()
+            logger.info("[STORAGE] Redis + PostgreSQL initialized")
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning("[STORAGE] init attempt %s/%s failed: %s", attempt, max_attempts, e)
+            time.sleep(delay_seconds)
+    raise RuntimeError(f"Storage initialization failed after retries: {last_error}")
+
+
+def load_chat_history(chat_id: str) -> list:
+    key = redis_history_key(chat_id)
+
+    try:
+        cached = redis_client.lrange(key, 0, -1)
+    except Exception:
+        cached = []
+
+    if cached:
+        history = []
+        for item in cached:
+            try:
+                history.append(json.loads(item))
+            except Exception:
+                continue
+        if history:
+            return history
+
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content, tool_calls, tool_call_id
+            FROM chat_messages
+            WHERE chat_id = %s
+            ORDER BY id ASC
+            """,
+            (chat_id,),
+        )
+        rows = cur.fetchall()
+
+    history = []
+    for role, content, tool_calls, tool_call_id in rows:
+        msg = {"role": role, "content": content}
+        if tool_calls is not None:
+            msg["tool_calls"] = tool_calls
+        if tool_call_id is not None:
+            msg["tool_call_id"] = tool_call_id
+        history.append(msg)
+
+    if history:
+        pipe = redis_client.pipeline()
+        for msg in history:
+            pipe.rpush(key, json.dumps(msg, ensure_ascii=False))
+        pipe.expire(key, REDIS_CHAT_TTL_SECONDS)
+        pipe.execute()
+
+    return history
+
+
+def persist_chat_delta(chat_id: str, entry: str, messages: list):
+    if not messages:
+        return
+
+    conn = get_pg_conn()
+    normalized_entry = entry.strip() if isinstance(entry, str) else ""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO chat_sessions(chat_id, entry, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (chat_id) DO UPDATE SET
+                entry = CASE
+                    WHEN EXCLUDED.entry IS NULL OR EXCLUDED.entry = '' THEN chat_sessions.entry
+                    ELSE EXCLUDED.entry
+                END,
+                updated_at = NOW()
+            """,
+            (chat_id, normalized_entry or None),
+        )
+        for msg in messages:
+            cur.execute(
+                """
+                INSERT INTO chat_messages(chat_id, role, content, tool_calls, tool_call_id)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    chat_id,
+                    msg.get("role", "assistant"),
+                    Json(msg.get("content")),
+                    Json(msg.get("tool_calls")) if msg.get("tool_calls") is not None else None,
+                    msg.get("tool_call_id"),
+                ),
+            )
+
+    key = redis_history_key(chat_id)
+    pipe = redis_client.pipeline()
+    for msg in messages:
+        pipe.rpush(key, json.dumps(msg, ensure_ascii=False))
+    pipe.expire(key, REDIS_CHAT_TTL_SECONDS)
+    pipe.execute()
+
+
+def clear_chat_context(chat_id: str):
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM chat_sessions WHERE chat_id = %s", (chat_id,))
+    redis_client.delete(redis_history_key(chat_id))
+
+
+def clear_all_chat_contexts():
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE chat_messages, chat_sessions RESTART IDENTITY")
+
+    keys = list(redis_client.scan_iter(match="openclaw:chat:history:*"))
+    if keys:
+        redis_client.delete(*keys)
+
+
+def clear_chat_contexts_by_entry(target_entry: str) -> int:
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT chat_id FROM chat_sessions WHERE entry = %s", (target_entry,))
+        rows = cur.fetchall()
+        chat_ids = [r[0] for r in rows]
+        cur.execute("DELETE FROM chat_sessions WHERE entry = %s", (target_entry,))
+
+    if chat_ids:
+        redis_client.delete(*[redis_history_key(cid) for cid in chat_ids])
+
+    return len(chat_ids)
+
+
+init_storage_with_retry()
 
 # ─── 工具定义（OpenAI Function Calling 格式）────────────────────────────────
 
@@ -1220,14 +1421,8 @@ def chat():
     entry = str(data.get("entry", "")).strip()
     logger.info(f"[CHAT] prompt='{prompt[:80]}' provider={current_config['provider']} model={current_config['model']}")
 
-    if chat_id not in conversation_histories:
-        conversation_histories[chat_id] = []
-    
-    # 记录 chat_id 对应的 entry（用于按入口清空）
-    if entry and chat_id not in chat_id_to_entry:
-        chat_id_to_entry[chat_id] = entry
-
-    history = conversation_histories[chat_id]
+    history = load_chat_history(chat_id)
+    history_start_idx = len(history)
 
     ollama_mode = current_config["provider"] == "ollama"
     images = data.get("images", [])
@@ -1309,6 +1504,7 @@ def chat():
                 "建议切换到 qwen2.5:3b 后再试（如需 llama3.2:3b 请先手动 ollama pull）；复杂/联网任务也建议改用 Copilot。"
             )
             history.append({"role": "assistant", "content": warn_reply})
+            persist_chat_delta(chat_id, entry, history[history_start_idx:])
             return jsonify({"response": warn_reply})
 
     user_msg_idx = len(history)
@@ -1326,6 +1522,7 @@ def chat():
         history.append({"role": "user", "content": user_content})
         warn_reply = f"⚠️ 当前模型 [{current_config['model']}] 不支持图片识别，请切换到 gpt-4o 或 gpt-4o-mini 后再发图片。"
         history.append({"role": "assistant", "content": warn_reply})
+        persist_chat_delta(chat_id, entry, history[history_start_idx:])
         return jsonify({"response": warn_reply})
     else:
         history.append({"role": "user", "content": user_content})
@@ -1355,6 +1552,7 @@ def chat():
             reply = response.choices[0].message.content or ""
             history[user_msg_idx] = {"role": "user", "content": restore_prompt}
             history.append({"role": "assistant", "content": reply})
+            persist_chat_delta(chat_id, entry, history[history_start_idx:])
             return jsonify({"response": reply})
 
         # Agent 循环：最多 10 轮工具调用
@@ -1408,16 +1606,16 @@ def chat():
                 reply = msg.content or ""
                 history[user_msg_idx] = {"role": "user", "content": restore_prompt}
                 history.append({"role": "assistant", "content": reply})
+                persist_chat_delta(chat_id, entry, history[history_start_idx:])
                 return jsonify({"response": reply})
 
         # 超过最大轮次
         reply = "⚠️ Agent 执行轮次已达上限，任务可能未完全完成，请重新描述或继续追问。"
         history.append({"role": "assistant", "content": reply})
+        persist_chat_delta(chat_id, entry, history[history_start_idx:])
         return jsonify({"response": reply})
 
     except Exception as e:
-        # 回滚本次对话新增的所有消息
-        del history[user_msg_idx:]
         return jsonify({"response": f"AI 服务出错: {e}"}), 500
 
 
@@ -1426,9 +1624,9 @@ def clear_context():
     data = request.json
     chat_id = str(data.get("chat_id", "default"))
     if chat_id == "all":
-        conversation_histories.clear()
+        clear_all_chat_contexts()
     else:
-        conversation_histories.pop(chat_id, None)
+        clear_chat_context(chat_id)
     return jsonify({"status": "ok"})
 
 
@@ -1495,16 +1693,11 @@ def clear_context_by_entry():
     
     if target_entry == "all":
         # 清空所有
-        conversation_histories.clear()
-        chat_id_to_entry.clear()
+        clear_all_chat_contexts()
         cleared_count = 0
     elif target_entry in ["web_frontend", "telegram", "feishu"]:
         # 清空指定入口的会话
-        to_delete = [cid for cid, ent in chat_id_to_entry.items() if ent == target_entry]
-        cleared_count = len(to_delete)
-        for cid in to_delete:
-            conversation_histories.pop(cid, None)
-            chat_id_to_entry.pop(cid, None)
+        cleared_count = clear_chat_contexts_by_entry(target_entry)
     else:
         return jsonify({"error": f"不支持的 entry: {target_entry}，必须是 all/web_frontend/telegram/feishu"}), 400
     

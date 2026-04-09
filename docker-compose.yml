@@ -16,6 +16,9 @@ services:
       - OLLAMA_SEARCH_TOTAL_MAX_CHARS=${OLLAMA_SEARCH_TOTAL_MAX_CHARS:-360}
       - OLLAMA_SEARCH_PROMPT_MAX_CHARS=${OLLAMA_SEARCH_PROMPT_MAX_CHARS:-180}
       - OLLAMA_SEARCH_HISTORY_MAX_CHARS=${OLLAMA_SEARCH_HISTORY_MAX_CHARS:-1200}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - REDIS_CHAT_TTL_SECONDS=${REDIS_CHAT_TTL_SECONDS:-604800}
+      - POSTGRES_DSN=${POSTGRES_DSN:-postgresql://openclaw:openclaw@postgres:5432/openclaw}
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
       - OPENAI_PROVIDER=${OPENAI_PROVIDER:-copilot}
@@ -27,6 +30,32 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - openclaw_workspace:/app/workspace
+    restart: always
+    networks:
+      - claw_net
+    depends_on:
+      - redis
+      - postgres
+
+  redis:
+    image: redis:7-alpine
+    container_name: openclaw_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - openclaw_redis_data:/data
+    restart: always
+    networks:
+      - claw_net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: openclaw_postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-openclaw}
+      - POSTGRES_USER=${POSTGRES_USER:-openclaw}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-openclaw}
+    volumes:
+      - openclaw_postgres_data:/var/lib/postgresql/data
     restart: always
     networks:
       - claw_net
@@ -84,6 +113,8 @@ volumes:
   caddy_data:
   caddy_config:
   openclaw_workspace:
+  openclaw_redis_data:
+  openclaw_postgres_data:
 
 networks:
   claw_net:
