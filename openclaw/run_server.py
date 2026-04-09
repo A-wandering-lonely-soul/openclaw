@@ -1103,6 +1103,14 @@ def resolve_weather_target_date(text: str):
     }
 
 
+def build_weather_fallback_query(text: str) -> str:
+    city_match = re.search(r"([\u4e00-\u9fa5]{2,8})(?:市)?", text)
+    if city_match:
+        city = city_match.group(1)
+        return f"{city} 天气 预报"
+    return "中国 天气 预报"
+
+
 def do_search(query: str, max_results: int = 3, max_content_chars: int = 300, total_max_chars: int = 2000) -> str:
     try:
         result = _tavily.search(query=query, max_results=max_results, search_depth="basic")
@@ -1247,12 +1255,27 @@ def chat():
                     max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
                     total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
                 )
+                if not search_result and is_weather_query(prompt):
+                    fallback_query = build_weather_fallback_query(prompt)
+                    logger.info(f"[OLLAMA_SEARCH] Empty result, retry with fallback query='{fallback_query}'")
+                    search_result = do_search(
+                        fallback_query,
+                        max_results=max(1, OLLAMA_SEARCH_MAX_RESULTS),
+                        max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
+                        total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
+                    )
                 logger.info(f"[OLLAMA_SEARCH] Got result length={len(search_result) if search_result else 0}")
                 if search_result:
                     user_content = (
                         f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
                         f"{weather_guard}"
                         f"{search_result}\n\n"
+                        f"用户问题：{prompt}"
+                    )
+                elif is_weather_query(prompt):
+                    user_content = (
+                        "以下是系统状态说明：已尝试联网搜索天气，但未检索到可用结果。"
+                        "请明确告诉用户当前无法确认实时天气，避免编造。\n\n"
                         f"用户问题：{prompt}"
                     )
         else:
