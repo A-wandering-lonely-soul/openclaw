@@ -53,6 +53,12 @@ OLLAMA_RECOMMENDED_MODELS = {"qwen2.5:3b"}
 OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "256"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
+OLLAMA_SEARCH_ENABLED = os.getenv("OLLAMA_SEARCH_ENABLED", "1") == "1"
+OLLAMA_SEARCH_MAX_RESULTS = int(os.getenv("OLLAMA_SEARCH_MAX_RESULTS", "1"))
+OLLAMA_SEARCH_SNIPPET_MAX_CHARS = int(os.getenv("OLLAMA_SEARCH_SNIPPET_MAX_CHARS", "220"))
+OLLAMA_SEARCH_TOTAL_MAX_CHARS = int(os.getenv("OLLAMA_SEARCH_TOTAL_MAX_CHARS", "360"))
+OLLAMA_SEARCH_PROMPT_MAX_CHARS = int(os.getenv("OLLAMA_SEARCH_PROMPT_MAX_CHARS", "180"))
+OLLAMA_SEARCH_HISTORY_MAX_CHARS = int(os.getenv("OLLAMA_SEARCH_HISTORY_MAX_CHARS", "1200"))
 
 # 不支持 function calling 的模型，退回纯对话模式
 TOOL_UNSUPPORTED_MODELS = {"o1-mini", "deepseek-reasoner"}
@@ -937,7 +943,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
         "- 实时搜索（后端自动）：当用户询问天气、新闻、价格等实时信息时，后端会自动用 Tavily 搜索引擎查询，"
         "并将搜索结果注入到用户消息的开头。你只需直接基于这些已注入的内容回答，"
         "不要说'我无法联网'，也不要自行用 http_get 重复查询同一问题。"
-    ) if _tavily and not ollama_mode else ""
+    ) if _tavily else ""
 
     web_mode = entry == WEB_FRONTEND_ENTRY
 
@@ -948,11 +954,12 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "- 纯文本问答：基于现有上下文给出简洁、直接的回答。\n"
         )
         policy_lines = (
-            "3. 不具备联网、定时任务、文件读写、命令执行能力；遇到这类请求必须明确说明限制。\n"
-            "4. 涉及天气/新闻/价格等实时信息时，若无已提供的实时数据，必须明确不确定性，不能编造。\n"
-            "5. 回答尽量简短，除非用户明确要求详细分析。\n"
-            "6. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
-            "7. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "3. 不具备直接联网、定时任务、文件读写、命令执行能力；遇到这类请求必须明确说明限制。\n"
+            "4. 若用户消息中已注入“搜索引擎获取的实时信息”，应严格基于注入内容作答。\n"
+            "5. 未注入实时信息时，涉及天气/新闻/价格等问题要明确不确定性，不能编造。\n"
+            "6. 回答尽量简短，除非用户明确要求详细分析。\n"
+            "7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "8. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     elif web_mode:
         principle_1 = "1. 用户说\"帮我做某事\"时，在能力范围内直接执行。"
@@ -1096,20 +1103,53 @@ def resolve_weather_target_date(text: str):
     }
 
 
-def do_search(query: str) -> str:
+def do_search(query: str, max_results: int = 3, max_content_chars: int = 300, total_max_chars: int = 2000) -> str:
     try:
-        result = _tavily.search(query=query, max_results=3, search_depth="basic")
+        result = _tavily.search(query=query, max_results=max_results, search_depth="basic")
         snippets = []
         for r in result.get("results", []):
             title = r.get("title", "")
-            content = r.get("content", "")[:300]
+            content = (r.get("content", "") or "").replace("\n", " ").strip()
+            if len(content) > max_content_chars:
+                content = content[:max_content_chars] + "..."
             url = r.get("url", "")
-            snippets.append(f"[{title}]({url})\n{content}")
+            candidate = f"[{title}]({url})\n{content}" if content else f"[{title}]({url})"
+            projected = "\n\n".join(snippets + [candidate])
+            if len(projected) > total_max_chars:
+                break
+            snippets.append(candidate)
         if snippets:
             return "\n\n".join(snippets)
     except Exception as e:
         return f"(搜索失败: {e})"
     return ""
+
+
+def _content_len(content) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, dict):
+                total += len(str(block.get("text", "")))
+        return total
+    return len(str(content))
+
+
+def should_downgrade_ollama_search(prompt: str, history: list, images: list) -> bool:
+    if not OLLAMA_SEARCH_ENABLED:
+        return True
+    if current_config["model"] in OLLAMA_HEAVY_MODELS:
+        return True
+    if images:
+        return True
+    if len(prompt) > OLLAMA_SEARCH_PROMPT_MAX_CHARS:
+        return True
+    history_chars = sum(_content_len(m.get("content")) for m in history[-12:])
+    if history_chars > OLLAMA_SEARCH_HISTORY_MAX_CHARS:
+        return True
+    return False
 
 
 def get_client():
@@ -1171,10 +1211,11 @@ def chat():
     history = conversation_histories[chat_id]
 
     ollama_mode = current_config["provider"] == "ollama"
+    images = data.get("images", [])
 
     # 联网搜索增强
     user_content = prompt
-    if not ollama_mode and needs_search(prompt) and not is_market_quote_query(prompt):
+    if needs_search(prompt) and not is_market_quote_query(prompt):
         search_query = prompt
         weather_guard = ""
 
@@ -1188,21 +1229,38 @@ def chat():
                     f"不要把今天天气当作{target['label']}天气。\n\n"
                 )
 
-        search_result = do_search(search_query)
-        if search_result:
-            user_content = (
-                f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
-                f"{weather_guard}"
-                f"{search_result}\n\n"
-                f"用户问题：{prompt}"
-            )
+        if ollama_mode:
+            if should_downgrade_ollama_search(prompt, history, images):
+                logger.info("Ollama search downgraded: skip web search for stability")
+            else:
+                search_result = do_search(
+                    search_query,
+                    max_results=max(1, OLLAMA_SEARCH_MAX_RESULTS),
+                    max_content_chars=max(80, OLLAMA_SEARCH_SNIPPET_MAX_CHARS),
+                    total_max_chars=max(120, OLLAMA_SEARCH_TOTAL_MAX_CHARS),
+                )
+                if search_result:
+                    user_content = (
+                        f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
+                        f"{weather_guard}"
+                        f"{search_result}\n\n"
+                        f"用户问题：{prompt}"
+                    )
+        else:
+            search_result = do_search(search_query)
+            if search_result:
+                user_content = (
+                    f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
+                    f"{weather_guard}"
+                    f"{search_result}\n\n"
+                    f"用户问题：{prompt}"
+                )
 
     # 处理图片（vision）
-    images = data.get("images", [])
     vision_supported = current_config["model"] not in VISION_UNSUPPORTED_MODELS
 
     if ollama_mode and current_config["model"] in OLLAMA_HEAVY_MODELS:
-        high_risk_request = len(prompt) > 200 or bool(images) or needs_search(prompt)
+        high_risk_request = len(prompt) > 200 or bool(images)
         if high_risk_request:
             warn_reply = (
                 f"⚠️ 当前 Ollama 模型 [{current_config['model']}] 属于重型模型，在低配 CPU 服务器上很容易超时或占满资源。"
