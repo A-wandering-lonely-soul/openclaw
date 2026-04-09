@@ -235,6 +235,84 @@ docker ps
 
 已启用的相关容器均为 `Up` 状态即部署成功。未选择的 Telegram 或飞书容器不会出现。
 
+### 8. 查看上下文存储（PostgreSQL / Redis）
+
+先进入 PostgreSQL：
+
+```bash
+docker compose exec postgres psql -U openclaw -d openclaw
+```
+
+在 `psql` 中执行：
+
+```sql
+\dt
+```
+
+预期能看到两张表：
+- `chat_sessions`
+- `chat_messages`
+
+查看最近会话：
+
+```sql
+SELECT chat_id, entry, updated_at
+FROM chat_sessions
+ORDER BY updated_at DESC
+LIMIT 20;
+```
+
+查看最近消息（上下文预览）：
+
+```sql
+SELECT id, chat_id, role, left(content::text, 200) AS content_preview, created_at
+FROM chat_messages
+ORDER BY id DESC
+LIMIT 50;
+```
+
+只看网页端会话（`entry = 'web_frontend'`）及消息条数：
+
+```sql
+SELECT s.chat_id, s.updated_at, COUNT(m.id) AS msg_count
+FROM chat_sessions s
+LEFT JOIN chat_messages m ON m.chat_id = s.chat_id
+WHERE s.entry = 'web_frontend'
+GROUP BY s.chat_id, s.updated_at
+ORDER BY s.updated_at DESC;
+```
+
+查看某个会话的完整上下文（按时间升序）：
+
+```sql
+SELECT id, role, content, created_at
+FROM chat_messages
+WHERE chat_id = 'CHAT_ID'
+ORDER BY id ASC;
+```
+
+退出 PostgreSQL：
+
+```sql
+\q
+```
+
+查看 Redis 会话缓存：
+
+```bash
+docker compose exec redis redis-cli --scan --pattern "openclaw:chat:history:*"
+```
+
+查看某个会话缓存长度：
+
+```bash
+docker compose exec redis redis-cli LLEN openclaw:chat:history:CHAT_ID
+```
+
+说明：
+- PostgreSQL 用于持久化，重启容器后数据仍在。
+- Redis 用于热缓存，按 `REDIS_CHAT_TTL_SECONDS` 自动过期。
+
 ---
 
 ## 网页前端（本地联调）
