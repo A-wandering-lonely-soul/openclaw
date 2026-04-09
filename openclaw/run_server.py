@@ -941,7 +941,21 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
 
     web_mode = entry == WEB_FRONTEND_ENTRY
 
-    if web_mode:
+    if ollama_mode:
+        principle_1 = "1. 当前为 Ollama 纯对话模式：只提供文本回答，不执行任何实际操作。"
+        execution_rule = "2. 严禁调用或假设工具能力；严禁声称“已创建任务/已执行命令/已抓取数据”。"
+        capability_lines = (
+            "- 纯文本问答：基于现有上下文给出简洁、直接的回答。\n"
+        )
+        policy_lines = (
+            "3. 不具备联网、定时任务、文件读写、命令执行能力；遇到这类请求必须明确说明限制。\n"
+            "4. 涉及天气/新闻/价格等实时信息时，若无已提供的实时数据，必须明确不确定性，不能编造。\n"
+            "5. 回答尽量简短，除非用户明确要求详细分析。\n"
+            "6. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "7. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+        )
+    elif web_mode:
+        principle_1 = "1. 用户说\"帮我做某事\"时，在能力范围内直接执行。"
         execution_rule = "2. 网页入口模式下，仅可调用 schedule_task 创建定时任务。"
         capability_lines = (
             "- schedule_task：创建 cron 定时任务（禁止特权命令，普通命令均可）\n"
@@ -959,6 +973,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     else:
+        principle_1 = "1. 用户说\"帮我做某事\"时，直接动手执行，不要只给文字建议。"
         execution_rule = "2. 需要运行脚本时，先用 write_file 写好，再用 shell_exec 执行。"
         capability_lines = (
             "- shell_exec：在 /app/workspace 目录执行 Shell 命令\n"
@@ -984,13 +999,6 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "10. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
             "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
-
-        if ollama_mode:
-            policy_lines += (
-                "\n12. 当前使用的是 Ollama 本地模型：优先给出简洁、直接、短一些的回答；除非用户明确要求，不要输出过长分析。"
-                "\n13. 不要假设自己具备联网/复杂工具能力；本地模型场景下以纯对话回答为主。"
-            )
-
     return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
 当前用户的 chat_id 为：{chat_id}
 当前服务器时间为：{now_iso}（时区：{timezone_name}，今天日期：{today}）
@@ -1000,7 +1008,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
 {tavily_line}
 
 工作原则：
-1. 用户说"帮我做某事"时，直接动手执行，不要只给文字建议。
+{principle_1}
 {execution_rule}
 {policy_lines}
 
