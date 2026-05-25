@@ -1613,6 +1613,26 @@ def _skill_prompt_for_entry(entry: str) -> str:
     return "\n\n".join(chunks)
 
 
+def _strip_code_fence_blocks(text: str, fence_lang: str) -> str:
+    pattern = rf"```\s*{re.escape(fence_lang)}\s*\n[\s\S]*?```"
+    return re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+
+def normalize_reply_for_entry(reply: str, entry: str) -> str:
+    """非 Web 入口下，将结构化渲染代码块降级为普通文本，避免其它平台出现协议块。"""
+    if entry == WEB_FRONTEND_ENTRY:
+        return reply
+
+    cleaned = reply or ""
+    cleaned = _strip_code_fence_blocks(cleaned, "chart")
+    cleaned = _strip_code_fence_blocks(cleaned, "datatable")
+    cleaned = _strip_code_fence_blocks(cleaned, "mermaid")
+
+    # 清理多余空行，尽量保持可读性
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned or "（已省略不可在当前平台渲染的结构化数据，请在 Web 端查看）"
+
+
 def _set_skill_enabled(skill_id: str, enabled: bool) -> tuple[bool, str]:
     manifest_path = SKILL_INDEX.get(skill_id)
     if not manifest_path or not os.path.isfile(manifest_path):
@@ -1858,22 +1878,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "12. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
             "13. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
-    return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
-当前用户的 chat_id 为：{chat_id}
-当前服务器时间为：{now_iso}（时区：{timezone_name}，今天日期：{today}）
-
-你拥有以下能力：
-{capability_lines}
-{tavily_line}
-
-工作原则：
-{principle_1}
-{execution_rule}
-{policy_lines}
-
-已启用 Skill 的补充规则：
-{skill_prompt if skill_prompt else "（无）"}
-
+    structured_output_spec = "" if not web_mode else """
 ## 结构化输出规范（Web 前端可视化）
 
 当数据适合可视化时，在文字说明之后附加以下格式的代码块，前端会自动渲染：
@@ -1896,6 +1901,25 @@ flowchart TD
 ```
 
 规则：只在数据真实具体时输出可视化块，不要凭空伪造数据；普通回复不需要附加代码块。"""
+
+    non_web_output_rule = "" if web_mode else "\n\n输出限制：当前不是 Web 入口，禁止输出 ```chart / ```datatable / ```mermaid 代码块；请仅输出普通文本。"
+
+    return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
+当前用户的 chat_id 为：{chat_id}
+当前服务器时间为：{now_iso}（时区：{timezone_name}，今天日期：{today}）
+
+你拥有以下能力：
+{capability_lines}
+{tavily_line}
+
+工作原则：
+{principle_1}
+{execution_rule}
+{policy_lines}
+
+已启用 Skill 的补充规则：
+{skill_prompt if skill_prompt else "（无）"}
+{structured_output_spec}{non_web_output_rule}"""
 
 # ─── 判断是否需要联网搜索 ─────────────────────────────────────────────────────
 
@@ -2214,6 +2238,7 @@ def chat():
                 request_args["temperature"] = OLLAMA_TEMPERATURE
             response = client.chat.completions.create(**request_args)
             reply = response.choices[0].message.content or ""
+            reply = normalize_reply_for_entry(reply, entry)
             history[user_msg_idx] = {"role": "user", "content": restore_prompt}
             history.append({"role": "assistant", "content": reply})
             persist_chat_delta(chat_id, entry, history[history_start_idx:])
@@ -2268,6 +2293,7 @@ def chat():
             else:
                 # AI 返回最终文本，结束循环
                 reply = msg.content or ""
+                reply = normalize_reply_for_entry(reply, entry)
                 history[user_msg_idx] = {"role": "user", "content": restore_prompt}
                 history.append({"role": "assistant", "content": reply})
                 persist_chat_delta(chat_id, entry, history[history_start_idx:])
