@@ -1618,6 +1618,37 @@ def _strip_code_fence_blocks(text: str, fence_lang: str) -> str:
     return re.sub(pattern, "", text, flags=re.IGNORECASE)
 
 
+def _markdown_to_plain_text(text: str) -> str:
+    """将常见 Markdown 标记降级为普通文本，避免在 Telegram/飞书出现格式标签。"""
+    if not text:
+        return ""
+
+    plain = text
+
+    # 链接降级: [标题](url) -> 标题 (url)
+    plain = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1 (\2)", plain)
+
+    # 行内代码与代码块分隔符清理
+    plain = re.sub(r"`([^`]+)`", r"\1", plain)
+    plain = plain.replace("```", "")
+
+    # 标题标记
+    plain = re.sub(r"^\s{0,3}#{1,6}\s+", "", plain, flags=re.MULTILINE)
+
+    # 加粗/斜体标记
+    plain = re.sub(r"\*\*([^*]+)\*\*", r"\1", plain)
+    plain = re.sub(r"__([^_]+)__", r"\1", plain)
+    plain = re.sub(r"\*([^*\n]+)\*", r"\1", plain)
+    plain = re.sub(r"_([^_\n]+)_", r"\1", plain)
+
+    # 引用标记
+    plain = re.sub(r"^\s*>\s?", "", plain, flags=re.MULTILINE)
+
+    # 清理多余空行
+    plain = re.sub(r"\n{3,}", "\n\n", plain)
+    return plain.strip()
+
+
 def normalize_reply_for_entry(reply: str, entry: str) -> str:
     """非 Web 入口下，将结构化渲染代码块降级为普通文本，避免其它平台出现协议块。"""
     if entry == WEB_FRONTEND_ENTRY:
@@ -1627,6 +1658,7 @@ def normalize_reply_for_entry(reply: str, entry: str) -> str:
     cleaned = _strip_code_fence_blocks(cleaned, "chart")
     cleaned = _strip_code_fence_blocks(cleaned, "datatable")
     cleaned = _strip_code_fence_blocks(cleaned, "mermaid")
+    cleaned = _markdown_to_plain_text(cleaned)
 
     # 清理多余空行，尽量保持可读性
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
