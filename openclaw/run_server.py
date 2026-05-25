@@ -4,9 +4,13 @@ import json
 import shlex
 import subprocess
 import time
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
+from typing import Callable
+from urllib.parse import urlparse
 import requests as http_requests
 import redis
 import psycopg2
@@ -15,6 +19,7 @@ from openai import OpenAI
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 try:
     from tavily import TavilyClient
@@ -358,6 +363,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "schedule_reminder",
+            "description": "创建一次性提醒，指定多少分钟后向 Telegram 推送提醒内容，只执行一次，不会循环。适合“5 分钟后提醒我...”这类需求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "提醒任务唯一名称"},
+                    "delay_minutes": {"type": "number", "description": "多少分钟后提醒，最小 1 分钟"},
+                    "message": {"type": "string", "description": "到点后要推送的提醒内容"},
+                    "description": {"type": "string", "description": "提醒说明（可选）", "default": ""},
+                    "notify_chat_id": {"type": "string", "description": "执行完毕后将提醒推送到此 Telegram chat_id，填入当前用户的 chat_id 即可。", "default": ""}
+                },
+                "required": ["name", "delay_minutes", "message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_tasks",
             "description": "列出所有已创建的定时任务及其状态。",
             "parameters": {"type": "object", "properties": {}}
@@ -407,14 +430,38 @@ TOOLS = [
     }
 ]
 
+BUILTIN_TOOL_NAMES = {
+    t.get("function", {}).get("name")
+    for t in TOOLS
+    if t.get("function", {}).get("name")
+}
+
 WEB_FRONTEND_ENTRY = "web_frontend"
 WEB_FRONTEND_ALLOWED_TOOL_NAMES = {
     "schedule_task",
+    "schedule_reminder",
     "list_tasks",
     "remove_task",
     "get_stock_price",
     "get_gold_price",
+    "analyze_quant_stock_strategy",
 }
+
+RUN_SERVER_DIR = os.path.dirname(os.path.realpath(__file__))
+SKILLS_SEARCH_DIRS = [
+    os.path.join(WORKSPACE, "skills"),
+    os.path.join(RUN_SERVER_DIR, "skills"),
+]
+_skills_env_dirs = [p.strip() for p in os.getenv("OPENCLAW_SKILLS_DIRS", "").split(",") if p.strip()]
+if _skills_env_dirs:
+    SKILLS_SEARCH_DIRS = _skills_env_dirs + SKILLS_SEARCH_DIRS
+
+TOOL_SCHEMA_REGISTRY: dict[str, dict] = {}
+TOOL_HANDLER_REGISTRY: dict[str, Callable[[dict, str], str]] = {}
+TOOL_ENTRY_ALLOWLIST: dict[str, set[str]] = {}
+TOOL_ORDER: list[str] = []
+SKILL_CATALOG: list[dict] = []
+SKILL_INDEX: dict[str, str] = {}
 
 # ─── 工具实现 ─────────────────────────────────────────────────────────────────
 
@@ -558,18 +605,45 @@ def _run_task_command(command: str, notify_chat_id: str = ""):
         logger.exception("[task] unexpected error command=%r", command)
 
 
+def _run_reminder_message(message: str, notify_chat_id: str = ""):
+    logger.info("[reminder] fire notify_chat_id=%r message=%r", notify_chat_id, message)
+    try:
+        if notify_chat_id:
+            ok = push_telegram_message(notify_chat_id, message[:4000])
+            if not ok:
+                logger.warning("[reminder] push failed, notify_chat_id=%r may not be a valid Telegram ID", notify_chat_id)
+    except Exception:
+        logger.exception("[reminder] unexpected error notify_chat_id=%r", notify_chat_id)
+
+
 def _restore_tasks():
     """服务重启后从文件恢复定时任务。"""
     tasks = _load_tasks()
     for name, info in tasks.items():
         try:
-            _scheduler.add_job(
-                _run_task_command,
-                CronTrigger.from_crontab(info["cron"], timezone=APP_TIMEZONE),
-                id=name,
-                args=[info["command"], info.get("notify_chat_id", "")],
-                replace_existing=True,
-            )
+            task_type = info.get("type", "cron")
+            if task_type == "once":
+                run_at_raw = info.get("run_at", "")
+                run_at = datetime.fromisoformat(run_at_raw) if run_at_raw else None
+                if run_at is None:
+                    raise ValueError("missing run_at")
+                if run_at.tzinfo is None:
+                    run_at = run_at.replace(tzinfo=APP_TIMEZONE)
+                _scheduler.add_job(
+                    _run_reminder_message,
+                    DateTrigger(run_date=run_at, timezone=APP_TIMEZONE),
+                    id=name,
+                    args=[info.get("message", ""), info.get("notify_chat_id", "")],
+                    replace_existing=True,
+                )
+            else:
+                _scheduler.add_job(
+                    _run_task_command,
+                    CronTrigger.from_crontab(info["cron"], timezone=APP_TIMEZONE),
+                    id=name,
+                    args=[info["command"], info.get("notify_chat_id", "")],
+                    replace_existing=True,
+                )
         except Exception as e:
             print(f"[scheduler] 恢复任务 {name} 失败: {e}")
 
@@ -592,6 +666,43 @@ def tool_schedule_task(name: str, cron: str, command: str, description: str = ""
         return msg
     except Exception as e:
         return f"创建任务失败: {e}"
+
+
+def tool_schedule_reminder(name: str, delay_minutes: float, message: str, description: str = "", notify_chat_id: str = "") -> str:
+    try:
+        delay_minutes = float(delay_minutes)
+        if delay_minutes < 1:
+            return "创建提醒失败：delay_minutes 不能小于 1"
+        if not message.strip():
+            return "创建提醒失败：message 不能为空"
+
+        run_at = datetime.now(APP_TIMEZONE) + timedelta(minutes=delay_minutes)
+        _scheduler.add_job(
+            _run_reminder_message,
+            DateTrigger(run_date=run_at, timezone=APP_TIMEZONE),
+            id=name,
+            args=[message, notify_chat_id],
+            replace_existing=True,
+        )
+        tasks = _load_tasks()
+        tasks[name] = {
+            "type": "once",
+            "run_at": run_at.isoformat(),
+            "message": message,
+            "description": description,
+            "notify_chat_id": notify_chat_id,
+        }
+        _save_tasks(tasks)
+        msg = (
+            f"✅ 一次性提醒 [{name}] 已创建\n"
+            f"  触发时间: {run_at.strftime('%Y-%m-%d %H:%M:%S')} ({APP_TIMEZONE_NAME})\n"
+            f"  提醒内容: {message}"
+        )
+        if notify_chat_id:
+            msg += "\n  到点后将主动推送到你的 Telegram"
+        return msg
+    except Exception as e:
+        return f"创建提醒失败: {e}"
 
 
 def _validate_web_schedule_command(command: str) -> tuple[bool, str]:
@@ -638,8 +749,13 @@ def tool_list_tasks() -> str:
         else:
             next_run = "未知"
         lines.append(f"\n  [{name}]")
-        lines.append(f"    cron: {info['cron']}")
-        lines.append(f"    命令: {info['command']}")
+        if info.get("type") == "once":
+            lines.append("    类型: 一次性提醒")
+            lines.append(f"    触发时间: {info.get('run_at', 'N/A')}")
+            lines.append(f"    提醒内容: {info.get('message', 'N/A')}")
+        else:
+            lines.append(f"    cron: {info['cron']}")
+            lines.append(f"    命令: {info['command']}")
         lines.append(f"    下次执行: {next_run}")
         if info.get("description"):
             lines.append(f"    说明: {info['description']}")
@@ -1158,53 +1274,503 @@ def tool_get_gold_price(symbol: str = "Au99.99") -> str:
     return "黄金价格查询失败：实时与历史数据源均不可用，请稍后重试。"
 
 
+def _extract_metric(text: str, label: str):
+    m = re.search(rf"{re.escape(label)}：([^\n]+)", text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    num_match = re.search(r"-?\d+(?:\.\d+)?", raw.replace(",", ""))
+    if not num_match:
+        return None
+    try:
+        return float(num_match.group(0))
+    except Exception:
+        return None
+
+
+def tool_analyze_quant_stock_strategy(symbol: str, horizon: str = "intraday", risk_level: str = "balanced") -> str:
+    symbol = (symbol or "").strip()
+    if not symbol:
+        return "量化策略分析失败：symbol 不能为空"
+
+    horizon = (horizon or "intraday").strip().lower()
+    if horizon not in {"intraday", "swing", "position"}:
+        horizon = "intraday"
+
+    risk_level = (risk_level or "balanced").strip().lower()
+    if risk_level not in {"conservative", "balanced", "aggressive"}:
+        risk_level = "balanced"
+
+    quote = tool_get_stock_price(symbol)
+    if quote.startswith("股价查询失败"):
+        return f"量化策略分析失败：先获取行情失败。\n{quote}"
+
+    latest = _extract_metric(quote, "最新价")
+    pct = _extract_metric(quote, "涨跌幅")
+    high = _extract_metric(quote, "最高")
+    low = _extract_metric(quote, "最低")
+    volume = _extract_metric(quote, "成交量")
+    amount = _extract_metric(quote, "成交额")
+
+    quant_score = 0.35
+    reasons = []
+
+    if amount is not None and amount >= 5e8:
+        quant_score += 0.22
+        reasons.append("成交额较高，程序化资金活跃概率上升")
+    if volume is not None and volume >= 5e4:
+        quant_score += 0.12
+        reasons.append("成交量较大，短线模型参与度通常更高")
+    if pct is not None and abs(pct) >= 2:
+        quant_score += 0.14
+        reasons.append("当日波动较明显，趋势/反转类量化策略更常见")
+    if latest and high is not None and low is not None and latest > 0:
+        amplitude = (high - low) / latest * 100
+        if amplitude >= 3:
+            quant_score += 0.12
+            reasons.append("振幅偏大，日内策略可操作空间更高")
+        elif amplitude < 1:
+            quant_score -= 0.06
+            reasons.append("振幅较小，短线量化博弈空间一般")
+
+    quant_score = max(0.05, min(0.95, quant_score))
+    if quant_score >= 0.7:
+        quant_level = "高"
+    elif quant_score >= 0.45:
+        quant_level = "中"
+    else:
+        quant_level = "低"
+
+    strategy_lines = []
+    pct_val = pct if isinstance(pct, (int, float)) else None
+    amp_val = None
+    if latest and high is not None and low is not None and latest > 0:
+        amp_val = (high - low) / latest * 100
+
+    if pct_val is not None and amp_val is not None:
+        if pct_val >= 2 and amp_val >= 3:
+            strategy_lines.append("主导可能：趋势跟随（动量）+ 追涨风控并行")
+        elif pct_val <= -2 and amp_val >= 3:
+            strategy_lines.append("主导可能：超跌反弹博弈 + 快速止损")
+        elif abs(pct_val) <= 1 and amp_val >= 2:
+            strategy_lines.append("主导可能：区间震荡下的均值回归")
+
+    if not strategy_lines:
+        strategy_lines.append("主导可能：低频择时与事件驱动，量化特征不算强")
+
+    horizon_map = {
+        "intraday": "日内（分钟级）",
+        "swing": "波段（数日到数周）",
+        "position": "中线（数周以上）",
+    }
+    risk_map = {
+        "conservative": "稳健",
+        "balanced": "平衡",
+        "aggressive": "激进",
+    }
+
+    advice = []
+    if risk_level == "conservative":
+        advice.append("以回撤控制为先：单笔风险建议控制在总资金的 0.5%-1.0%")
+        advice.append("优先等回踩确认或缩量企稳，不追高")
+    elif risk_level == "balanced":
+        advice.append("采用分批进出：例如 5:3:2 分仓，避免一次性满仓")
+        advice.append("设置明确失效位，跌破即执行纪律止损")
+    else:
+        advice.append("可小仓位做动量试错，但必须配硬止损与止盈回撤线")
+        advice.append("若放量不延续或冲高回落，优先减仓而非补仓")
+
+    advice.append("当前功能仅做研究与提醒，不自动下单、不代客交易")
+
+    reason_text = "；".join(reasons) if reasons else "当前快照信号有限，结论以中性判断为主"
+    strategy_text = "\n".join(f"- {line}" for line in strategy_lines)
+    advice_text = "\n".join(f"- {line}" for line in advice)
+
+    return (
+        "【量化交易策略评估（研究版）】\n"
+        f"标的：{symbol}\n"
+        f"分析周期：{horizon_map[horizon]}\n"
+        f"风险偏好：{risk_map[risk_level]}\n"
+        f"量化交易参与判断：{quant_level}（置信度 {round(quant_score * 100, 1)}%）\n"
+        f"判断依据：{reason_text}\n\n"
+        "可能的当前量化策略：\n"
+        f"{strategy_text}\n\n"
+        "执行建议（仅提醒，不自动交易）：\n"
+        f"{advice_text}\n\n"
+        "附：原始行情快照\n"
+        f"{quote}\n\n"
+        "如果你希望，我可以进一步按“每30分钟/每小时”给出同一标的的策略变化提醒文案（仍然只发消息提醒）。"
+    )
+
+
+def _iter_skill_manifest_paths() -> list[str]:
+    manifests: list[str] = []
+    for root in SKILLS_SEARCH_DIRS:
+        try:
+            if not os.path.isdir(root):
+                continue
+            for name in sorted(os.listdir(root)):
+                skill_dir = os.path.join(root, name)
+                if not os.path.isdir(skill_dir):
+                    continue
+                manifest = os.path.join(skill_dir, "skill.json")
+                if os.path.isfile(manifest):
+                    manifests.append(manifest)
+        except Exception:
+            logger.exception("[skill] failed to scan root=%s", root)
+    return manifests
+
+
+def _normalize_entry_allowlist(raw) -> set[str]:
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        return set()
+    normalized = set()
+    for v in values:
+        text = str(v).strip()
+        if not text:
+            continue
+        normalized.add(text)
+    return normalized
+
+
+def _register_tool(name: str, schema: dict, handler: Callable[[dict, str], str], entry_allowlist: set[str] | None = None):
+    if name in TOOL_SCHEMA_REGISTRY:
+        logger.warning("[skill] tool name conflict skipped: %s", name)
+        return
+    TOOL_SCHEMA_REGISTRY[name] = schema
+    TOOL_HANDLER_REGISTRY[name] = handler
+    TOOL_ENTRY_ALLOWLIST[name] = entry_allowlist or set()
+    TOOL_ORDER.append(name)
+
+
+def _skill_handler_by_key(handler_key: str):
+    handler_map: dict[str, Callable[[dict, str], str]] = {
+        "quant_stock_strategy_advisor": lambda args, _entry: tool_analyze_quant_stock_strategy(
+            args.get("symbol", ""),
+            args.get("horizon", "intraday"),
+            args.get("risk_level", "balanced"),
+        ),
+    }
+    return handler_map.get(handler_key)
+
+
+def _load_skills_into_registry():
+    SKILL_CATALOG.clear()
+    SKILL_INDEX.clear()
+
+    for manifest_path in _iter_skill_manifest_paths():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            logger.exception("[skill] invalid manifest: %s", manifest_path)
+            continue
+
+        skill_id = str(data.get("id", "")).strip()
+        if not skill_id:
+            logger.warning("[skill] missing id: %s", manifest_path)
+            continue
+        if skill_id in SKILL_INDEX:
+            logger.warning("[skill] duplicated id skipped: %s", skill_id)
+            continue
+
+        enabled = bool(data.get("enabled", True))
+        name = str(data.get("name", skill_id)).strip() or skill_id
+        entry_allowlist = _normalize_entry_allowlist(data.get("entry_allowlist"))
+        tools = data.get("tools", [])
+        tool_handlers = data.get("tool_handlers", {}) or {}
+        system_prompt = str(data.get("system_prompt", "")).strip()
+
+        record = {
+            "id": skill_id,
+            "name": name,
+            "enabled": enabled,
+            "entry_allowlist": sorted(entry_allowlist),
+            "manifest": manifest_path,
+            "tools": [],
+            "system_prompt": system_prompt,
+        }
+
+        SKILL_INDEX[skill_id] = manifest_path
+        if enabled:
+            for schema in tools:
+                tool_name = str(schema.get("function", {}).get("name", "")).strip()
+                if not tool_name:
+                    continue
+                handler_key = str(tool_handlers.get(tool_name, "")).strip()
+                if not handler_key:
+                    logger.warning("[skill] no handler mapping for tool=%s skill=%s", tool_name, skill_id)
+                    continue
+                handler = _skill_handler_by_key(handler_key)
+                if handler is None:
+                    logger.warning("[skill] unknown handler key=%s skill=%s", handler_key, skill_id)
+                    continue
+                _register_tool(tool_name, schema, handler, entry_allowlist)
+                record["tools"].append(tool_name)
+
+        SKILL_CATALOG.append(record)
+
+
+def _reload_tooling_registry():
+    TOOL_SCHEMA_REGISTRY.clear()
+    TOOL_HANDLER_REGISTRY.clear()
+    TOOL_ENTRY_ALLOWLIST.clear()
+    TOOL_ORDER.clear()
+
+    # 先注册内置工具
+    _register_tool(
+        "shell_exec",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "shell_exec"),
+        lambda args, _entry: tool_shell_exec(args.get("command", ""), args.get("timeout", 30)),
+    )
+    _register_tool(
+        "write_file",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "write_file"),
+        lambda args, _entry: tool_write_file(args.get("path", ""), args.get("content", "")),
+    )
+    _register_tool(
+        "read_file",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "read_file"),
+        lambda args, _entry: tool_read_file_content(args.get("path", "")),
+    )
+    _register_tool(
+        "http_get",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "http_get"),
+        lambda args, _entry: tool_http_get(args.get("url", ""), args.get("headers", {})),
+    )
+    _register_tool(
+        "schedule_task",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "schedule_task"),
+        lambda args, entry: tool_schedule_task_web(
+            args.get("name", ""), args.get("cron", ""), args.get("command", ""),
+            args.get("description", ""), args.get("notify_chat_id", "")
+        ) if entry == WEB_FRONTEND_ENTRY else tool_schedule_task(
+            args.get("name", ""), args.get("cron", ""), args.get("command", ""),
+            args.get("description", ""), args.get("notify_chat_id", "")
+        ),
+    )
+    _register_tool(
+        "schedule_reminder",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "schedule_reminder"),
+        lambda args, _entry: tool_schedule_reminder(
+            args.get("name", ""), args.get("delay_minutes", 0), args.get("message", ""),
+            args.get("description", ""), args.get("notify_chat_id", "")
+        ),
+    )
+    _register_tool(
+        "list_tasks",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "list_tasks"),
+        lambda args, _entry: tool_list_tasks(),
+    )
+    _register_tool(
+        "remove_task",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "remove_task"),
+        lambda args, _entry: tool_remove_task(args.get("name", "")),
+    )
+    _register_tool(
+        "get_stock_price",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "get_stock_price"),
+        lambda args, _entry: tool_get_stock_price(args.get("symbol", "")),
+    )
+    _register_tool(
+        "get_gold_price",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "get_gold_price"),
+        lambda args, _entry: tool_get_gold_price(args.get("symbol", "Au99.99")),
+    )
+
+    # 再加载外部 Skill
+    _load_skills_into_registry()
+
+
+def _tool_allowed_for_entry(tool_name: str, entry: str) -> bool:
+    effective_entry = (entry or "default").strip() or "default"
+    allowlist = TOOL_ENTRY_ALLOWLIST.get(tool_name, set())
+    if allowlist and "*" not in allowlist and effective_entry not in allowlist:
+        return False
+    if entry == WEB_FRONTEND_ENTRY and tool_name not in WEB_FRONTEND_ALLOWED_TOOL_NAMES:
+        return False
+    return True
+
+
+def _skill_prompt_for_entry(entry: str) -> str:
+    effective_entry = (entry or "default").strip() or "default"
+    chunks = []
+    for s in SKILL_CATALOG:
+        if not s.get("enabled"):
+            continue
+        allow = set(s.get("entry_allowlist") or [])
+        if allow and "*" not in allow and effective_entry not in allow:
+            continue
+        prompt = str(s.get("system_prompt", "")).strip()
+        if prompt:
+            chunks.append(f"[{s.get('name', s.get('id', 'skill'))}]\n{prompt}")
+    return "\n\n".join(chunks)
+
+
+def _set_skill_enabled(skill_id: str, enabled: bool) -> tuple[bool, str]:
+    manifest_path = SKILL_INDEX.get(skill_id)
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return False, "skill 不存在"
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["enabled"] = bool(enabled)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def _normalize_skill_dirname(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", (name or "").strip()).strip("-_")
+    return cleaned or "skill"
+
+
+def _validate_public_git_url(git_url: str) -> tuple[bool, str]:
+    try:
+        parsed = urlparse(git_url)
+    except Exception:
+        return False, "git_url 格式无效"
+    if parsed.scheme != "https":
+        return False, "仅允许 https Git URL"
+    if not parsed.netloc:
+        return False, "git_url 缺少域名"
+    if parsed.username or parsed.password:
+        return False, "git_url 不允许内嵌账号或密码"
+    return True, ""
+
+
+def _discover_skill_source_dir(repo_root: str, subdir: str = "") -> tuple[str | None, str]:
+    if subdir:
+        normalized = os.path.normpath(subdir).replace("\\", "/").lstrip("/")
+        if normalized.startswith("../") or normalized == "..":
+            return None, "subdir 非法"
+        candidate = os.path.join(repo_root, normalized)
+        if os.path.isfile(os.path.join(candidate, "skill.json")):
+            return candidate, ""
+        return None, f"指定 subdir 未找到 skill.json: {subdir}"
+
+    root_manifest = os.path.join(repo_root, "skill.json")
+    if os.path.isfile(root_manifest):
+        return repo_root, ""
+
+    candidates = []
+    try:
+        for name in os.listdir(repo_root):
+            skill_dir = os.path.join(repo_root, name)
+            if os.path.isdir(skill_dir) and os.path.isfile(os.path.join(skill_dir, "skill.json")):
+                candidates.append(skill_dir)
+    except Exception:
+        return None, "读取仓库目录失败"
+
+    if len(candidates) == 1:
+        return candidates[0], ""
+    if len(candidates) > 1:
+        return None, "仓库包含多个 skill.json，请通过 subdir 指定安装路径"
+    return None, "仓库中未发现 skill.json"
+
+
+def _install_skill_from_git(git_url: str, ref: str = "", subdir: str = "", install_name: str = "", overwrite: bool = False):
+    ok, msg = _validate_public_git_url(git_url)
+    if not ok:
+        return False, msg, None
+
+    base_skills_dir = os.path.join(WORKSPACE, "skills")
+    os.makedirs(base_skills_dir, exist_ok=True)
+
+    temp_root = tempfile.mkdtemp(prefix="skill-install-", dir=WORKSPACE)
+    try:
+        clone_dir = os.path.join(temp_root, "repo")
+        cmd = ["git", "clone", "--depth", "1"]
+        if ref:
+            cmd.extend(["--branch", ref])
+        cmd.extend([git_url, clone_dir])
+
+        result = subprocess.run(
+            cmd,
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_SAFE_ENV,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            return False, f"git clone 失败: {err[:400]}", None
+
+        source_dir, discover_err = _discover_skill_source_dir(clone_dir, subdir)
+        if not source_dir:
+            return False, discover_err, None
+
+        manifest_path = os.path.join(source_dir, "skill.json")
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        skill_id = str(manifest.get("id", "")).strip()
+        skill_name = install_name or skill_id or os.path.basename(source_dir)
+        target_dirname = _normalize_skill_dirname(skill_name)
+        target_dir = os.path.join(base_skills_dir, target_dirname)
+
+        if os.path.exists(target_dir):
+            if not overwrite:
+                return False, f"目标目录已存在: {target_dirname}，如需覆盖请传 overwrite=true", None
+            shutil.rmtree(target_dir)
+
+        shutil.copytree(source_dir, target_dir)
+        installed_manifest = os.path.join(target_dir, "skill.json")
+        if not os.path.isfile(installed_manifest):
+            return False, "安装后未检测到 skill.json", None
+
+        return True, "ok", {
+            "dir": target_dirname,
+            "manifest": installed_manifest,
+            "skill_id": skill_id,
+            "name": str(manifest.get("name", skill_id or target_dirname)).strip() or target_dirname,
+            "source": git_url,
+            "ref": ref,
+            "subdir": subdir,
+        }
+    except subprocess.TimeoutExpired:
+        return False, "git clone 超时", None
+    except Exception as e:
+        return False, f"安装失败: {e}", None
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def tools_for_entry(entry: str) -> list[dict]:
-    if entry == WEB_FRONTEND_ENTRY:
-        return [
-            t for t in TOOLS
-            if t.get("function", {}).get("name") in WEB_FRONTEND_ALLOWED_TOOL_NAMES
-        ]
-    return TOOLS
+    return [
+        TOOL_SCHEMA_REGISTRY[name]
+        for name in TOOL_ORDER
+        if _tool_allowed_for_entry(name, entry)
+    ]
 
 
 def execute_tool(name: str, args: dict, entry: str = "") -> str:
-    if entry == WEB_FRONTEND_ENTRY and name not in WEB_FRONTEND_ALLOWED_TOOL_NAMES:
-        return "权限不足：网页入口仅允许创建定时任务。"
+    if not _tool_allowed_for_entry(name, entry):
+        return "权限不足：当前入口不允许调用该工具。"
 
-    if name == "shell_exec":
-        return tool_shell_exec(args.get("command", ""), args.get("timeout", 30))
-    elif name == "write_file":
-        return tool_write_file(args.get("path", ""), args.get("content", ""))
-    elif name == "read_file":
-        return tool_read_file_content(args.get("path", ""))
-    elif name == "http_get":
-        return tool_http_get(args.get("url", ""), args.get("headers", {}))
-    elif name == "schedule_task":
-        if entry == WEB_FRONTEND_ENTRY:
-            return tool_schedule_task_web(
-                args.get("name", ""), args.get("cron", ""),
-                args.get("command", ""), args.get("description", ""),
-                args.get("notify_chat_id", "")
-            )
-        return tool_schedule_task(
-            args.get("name", ""), args.get("cron", ""),
-            args.get("command", ""), args.get("description", ""),
-            args.get("notify_chat_id", "")
-        )
-    elif name == "list_tasks":
-        return tool_list_tasks()
-    elif name == "remove_task":
-        return tool_remove_task(args.get("name", ""))
-    elif name == "get_stock_price":
-        return tool_get_stock_price(args.get("symbol", ""))
-    elif name == "get_gold_price":
-        return tool_get_gold_price(args.get("symbol", "Au99.99"))
-    else:
+    handler = TOOL_HANDLER_REGISTRY.get(name)
+    if handler is None:
         return f"未知工具: {name}"
+    try:
+        return handler(args or {}, entry)
+    except Exception as e:
+        logger.exception("[tool] execute failed name=%s", name)
+        return f"工具执行失败: {e}"
+
 
 
 # 恢复持久化的定时任务
 _restore_tasks()
+_reload_tooling_registry()
 
 # ─── 系统提示词（动态，含当前 chat_id）──────────────────────────────────────
 
@@ -1222,6 +1788,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
     ) if _tavily else ""
 
     web_mode = entry == WEB_FRONTEND_ENTRY
+    skill_prompt = _skill_prompt_for_entry(entry)
 
     if ollama_mode:
         principle_1 = "1. 当前为 Ollama 纯对话模式：只提供文本回答，不执行任何实际操作。"
@@ -1239,9 +1806,10 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
         )
     elif web_mode:
         principle_1 = "1. 用户说\"帮我做某事\"时，在能力范围内直接执行。"
-        execution_rule = "2. 网页入口模式下，可调用定时任务与行情工具（schedule_task/list_tasks/remove_task/get_stock_price/get_gold_price）。"
+        execution_rule = "2. 网页入口模式下，可调用定时任务、一次性提醒与行情工具（schedule_task/schedule_reminder/list_tasks/remove_task/get_stock_price/get_gold_price）。"
         capability_lines = (
             "- schedule_task：创建 cron 定时任务（禁止特权命令，普通命令均可）\n"
+            "- schedule_reminder：创建一次性提醒（例如‘5 分钟后提醒我…’）\n"
             "- list_tasks：列出已有定时任务\n"
             "- remove_task：删除指定定时任务\n"
             "- get_stock_price：查询 A 股实时行情（支持代码或名称）\n"
@@ -1251,14 +1819,14 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "3. 网页入口受限：允许定时任务管理与行情查询；禁止系统控制、禁止读写文件、禁止任意网络抓取。\n"
             "4. 定时命令禁止使用 sudo/systemctl/docker 等特权命令，普通 shell 命令均可。\n"
             "5. 网页入口无法收到推送通知，不要设置 notify_chat_id；如需在任务执行后收到通知，请通过 Telegram Bot 使用。\n"
-            "6. cron 是周期性任务，无法做到“仅执行一次”。若用户说“X 分钟后提醒”，需换算到具体时分，"
-            "告知用户任务将在该时刻及此后每天同一时刻重复触发，并询问是否接受后再创建。\n"
-            "7. 遇到错误要基于工具输出解释原因并给出可执行修正方案。\n"
-            "8. 任务完成后简洁告知用户任务名称、cron 表达式、下次执行时间（北京时间）。\n"
-            "9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price，不要擅自改成定时任务。\n"
-            "10. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
-            "11. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "12. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "6. 若用户说‘X 分钟后提醒我…’，必须优先使用 schedule_reminder 创建一次性提醒，不能转成周期 cron。\n"
+            "7. cron 只用于周期性任务；一次性提醒必须只触发一次。\n"
+            "8. 遇到错误要基于工具输出解释原因并给出可执行修正方案。\n"
+            "9. 任务完成后简洁告知用户任务名称、触发时间或 cron、下次执行时间（北京时间）。\n"
+            "10. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price，不要擅自改成定时任务。\n"
+            "11. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "12. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "13. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     else:
         principle_1 = "1. 用户说\"帮我做某事\"时，直接动手执行，不要只给文字建议。"
@@ -1269,6 +1837,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "- read_file：读取工作区文件内容\n"
             "- http_get：发起 HTTP GET 请求（查询公开 API、抓取数据）\n"
             "- schedule_task：创建 cron 定时任务（服务重启后自动恢复）\n"
+            "- schedule_reminder：创建一次性提醒（例如‘5 分钟后提醒我…’）\n"
             "- list_tasks：列出所有定时任务\n"
             "- remove_task：删除定时任务\n"
             "- get_stock_price：查询A股实时股价（支持股票代码或名称，如\"600519\"或\"贵州茅台\"）\n"
@@ -1279,13 +1848,15 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "3. 设置定时任务用 schedule_task，而不是直接修改 crontab。\n"
             "4. 如果用户希望收到定时任务的执行结果，在调用 schedule_task 时将 notify_chat_id 设为 "
             f"{chat_id}，系统会自动通过 Telegram 主动推送结果给用户。\n"
-            "5. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。\n"
-            "6. 任务完成后简洁告知用户结果和下次执行时间等关键信息。\n"
-            "7. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
-            "8. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。\n"
-            "9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。\n"
-            "10. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "5. 若用户说‘X 分钟后提醒我…’，必须优先使用 schedule_reminder 创建一次性提醒，不能转成周期 cron。\n"
+            "6. cron 只用于周期性任务；一次性提醒必须只触发一次。\n"
+            "7. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。\n"
+            "8. 任务完成后简洁告知用户结果和下次执行时间等关键信息。\n"
+            "9. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "10. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。\n"
+            "11. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。\n"
+            "12. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "13. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     return f"""你是 OpenClaw，一个运行在 Linux 服务器上、具备真实执行能力的 AI Agent。
 当前用户的 chat_id 为：{chat_id}
@@ -1299,6 +1870,9 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
 {principle_1}
 {execution_rule}
 {policy_lines}
+
+已启用 Skill 的补充规则：
+{skill_prompt if skill_prompt else "（无）"}
 
 ## 结构化输出规范（Web 前端可视化）
 
@@ -1718,6 +2292,73 @@ def clear_context():
     else:
         clear_chat_context(chat_id)
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/skills", methods=["GET"])
+def list_skills():
+    return jsonify({
+        "skills": SKILL_CATALOG,
+        "tool_count": len(TOOL_ORDER),
+        "tool_names": TOOL_ORDER,
+        "skill_dirs": SKILLS_SEARCH_DIRS,
+    })
+
+
+@app.route("/api/skills/reload", methods=["POST"])
+def reload_skills():
+    _reload_tooling_registry()
+    return jsonify({
+        "status": "ok",
+        "skills": SKILL_CATALOG,
+        "tool_names": TOOL_ORDER,
+    })
+
+
+@app.route("/api/skills/toggle", methods=["POST"])
+def toggle_skill():
+    data = request.json or {}
+    skill_id = str(data.get("id", "")).strip()
+    enabled = bool(data.get("enabled", False))
+    if not skill_id:
+        return jsonify({"error": "id 不能为空"}), 400
+
+    ok, msg = _set_skill_enabled(skill_id, enabled)
+    if not ok:
+        return jsonify({"error": msg}), 400
+
+    _reload_tooling_registry()
+    return jsonify({"status": "ok", "id": skill_id, "enabled": enabled})
+
+
+@app.route("/api/skills/install", methods=["POST"])
+def install_skill():
+    data = request.json or {}
+    git_url = str(data.get("git_url", "")).strip()
+    ref = str(data.get("ref", "")).strip()
+    subdir = str(data.get("subdir", "")).strip()
+    install_name = str(data.get("install_name", "")).strip()
+    overwrite = bool(data.get("overwrite", False))
+
+    if not git_url:
+        return jsonify({"error": "git_url 不能为空"}), 400
+
+    ok, msg, install_info = _install_skill_from_git(
+        git_url=git_url,
+        ref=ref,
+        subdir=subdir,
+        install_name=install_name,
+        overwrite=overwrite,
+    )
+    if not ok:
+        return jsonify({"error": msg}), 400
+
+    _reload_tooling_registry()
+    return jsonify({
+        "status": "ok",
+        "installed": install_info,
+        "skills": SKILL_CATALOG,
+        "tool_names": TOOL_ORDER,
+    })
 
 
 @app.route("/api/images", methods=["GET"])

@@ -7,6 +7,7 @@
 - 支持多模型切换（GitHub Copilot GPT-4.1 / gpt-4o 等、DeepSeek V3 / R1）
 - 自动联网搜索（Tavily），问到实时信息时自动查询
 - A股行情多通道查询（Tushare Pro 优先，失败自动切换 AKShare/东方财富/腾讯兜底）
+- Skill 插件机制（第一版）：支持从本地目录加载 skill.json，动态扩展工具与系统提示
 - 聊天上下文采用 Redis（热缓存）+ PostgreSQL（持久化）
 - 支持 Telegram Bot 和飞书机器人双渠道接入
 - 服务器管理面板 `openclaw-box`
@@ -315,6 +316,75 @@ docker compose exec redis redis-cli LLEN openclaw:chat:history:CHAT_ID
 
 ---
 
+## Skill 插件（第一版）
+
+### 目录与加载规则
+
+- 后端会自动扫描以下目录中的 `*/skill.json`：
+   - `/app/workspace/skills`（容器卷，推荐）
+   - `/app/openclaw/skills`（随镜像代码）
+- 可通过环境变量覆盖/追加：
+   - `OPENCLAW_SKILLS_DIRS=/custom/skills1,/custom/skills2`
+
+### skill.json 最小示例
+
+```json
+{
+   "id": "demo_skill",
+   "name": "Demo Skill",
+   "enabled": true,
+   "entry_allowlist": ["default", "web_frontend"],
+   "system_prompt": "这里写给模型的补充规则。",
+   "tools": [
+      {
+         "type": "function",
+         "function": {
+            "name": "your_tool_name",
+            "description": "工具说明",
+            "parameters": {
+               "type": "object",
+               "properties": {
+                  "input": {"type": "string"}
+               },
+               "required": ["input"]
+            }
+         }
+      }
+   ],
+   "tool_handlers": {
+      "your_tool_name": "your_handler_key"
+   }
+}
+```
+
+说明：第一版为了安全，`tool_handlers` 只能映射到后端内置允许的 handler key（白名单），不会直接执行第三方任意 Python 代码。
+
+### Skill 管理 API
+
+- `GET /api/skills`：查看已扫描 Skill、可用工具、扫描目录
+- `POST /api/skills/reload`：重新加载 Skill（新增/修改后调用）
+- `POST /api/skills/toggle`：启用/禁用 Skill
+   - body 示例：`{"id":"demo_skill","enabled":true}`
+- `POST /api/skills/install`：通过 Git URL 在线安装公开 Skill（安装后自动 reload）
+   - body 字段：
+      - `git_url`（必填）：公开仓库 HTTPS 地址
+      - `ref`（可选）：分支或 tag
+      - `subdir`（可选）：仓库内 Skill 子目录（当仓库包含多个 skill 时建议填写）
+      - `install_name`（可选）：本地安装目录名
+      - `overwrite`（可选）：同名目录是否覆盖，默认 `false`
+   - body 示例：`{"git_url":"https://github.com/owner/repo.git","ref":"main","subdir":"skills/my_skill","overwrite":true}`
+
+### 接入“别人公开 Skill”的建议流程
+
+1. 在管理界面或接口调用 `POST /api/skills/install`，填入公开 Git URL
+2. 审核 `skill.json` 的 `tool_handlers` 是否在你允许范围内
+3. 安装后会自动 reload，也可手动调用 `POST /api/skills/reload`
+4. 用 `GET /api/skills` 检查工具是否已注册
+
+> 安全建议：不要直接信任未知来源 Skill；先在测试环境启用并观察日志后再上生产。
+
+---
+
 ## 网页前端（本地联调）
 
 项目已支持独立网页前端，前端目录位于当前仓库同级目录：`../openclaw-web`。
@@ -478,6 +548,53 @@ openclaw-box
 ---
 
 ## 常用运维命令
+
+### 本地联调命令速查（后端 + 前端）
+
+后端本地直跑（用于快速调试 API）：
+
+```bash
+cd ~/openclaw
+python openclaw/run_server.py
+```
+
+前端本地开发（Vite）：
+
+```bash
+cd ~/openclaw-web
+npm install
+npm run dev
+```
+
+本地 Docker 联调（更接近生产）：
+
+```bash
+cd ~/openclaw
+docker compose up -d --build openclaw redis postgres
+
+# 需要联调 Telegram/飞书时按需启用
+docker compose --profile telegram up -d --build telegram_bot
+docker compose --profile feishu up -d --build feishu_bot
+```
+
+联调常用检查：
+
+```bash
+# 后端健康与模型状态
+curl http://127.0.0.1:8000/api/get_model
+
+# Skill 列表（确认是否加载）
+curl http://127.0.0.1:8000/api/skills
+
+# 关键日志
+docker logs -f openclaw_service
+docker logs -f telegram_bot
+```
+
+说明：
+- 前端默认地址 `http://localhost:5173`，通过 Vite 代理访问后端 `/api/*`。
+- Telegram 本地联调时避免和线上同时用同一 Bot Token（会抢 update）。
+- Skill 在线安装依赖容器内 `git`，若安装失败先看 `openclaw_service` 日志。
 
 ```bash
 # 查看实时日志

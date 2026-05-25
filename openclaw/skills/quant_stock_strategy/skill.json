@@ -1,0 +1,43 @@
+{
+  "id": "quant_stock_strategy_v1",
+  "name": "股票量化策略顾问",
+  "name_en": "Stock Quant Strategy Advisor",
+  "enabled": true,
+  "entry_allowlist": ["default", "web_frontend", "telegram", "feishu"],
+  "description": "分析单只股票当前是否存在量化交易参与迹象，推断当前更可能的量化策略类型，并给出仅用于提醒的建议（不自动下单）。",
+  "description_en": "Analyze whether quant trading is active on a stock, infer likely strategy regimes, and output reminder-only suggestions.",
+  "summary_zh": "功能概述：先基于实时行情快照判断量化资金参与度（高/中/低），再推断当前可能策略（趋势跟随、均值回归、超跌反弹等），最后输出按风险偏好生成的提醒型建议。安全边界：只做研究分析与消息提醒，不执行自动交易、不代客交易。",
+  "system_prompt": "当用户询问某只股票当前量化策略时，优先调用 analyze_quant_stock_strategy。先判断量化交易参与度，再给出当前可能策略和可执行建议。你只能提供研究与消息提醒建议，严禁承诺自动交易或代客下单。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "analyze_quant_stock_strategy",
+        "description": "评估某只 A 股当前是否存在明显量化交易参与，并给出当前可能量化策略与提醒型建议（仅研究，不自动交易）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "description": "股票代码或名称，例如 600256 或 广汇能源"
+            },
+            "horizon": {
+              "type": "string",
+              "description": "分析周期，可选 intraday（日内）、swing（波段）、position（中线）",
+              "default": "intraday"
+            },
+            "risk_level": {
+              "type": "string",
+              "description": "风险偏好，可选 conservative、balanced、aggressive",
+              "default": "balanced"
+            }
+          },
+          "required": ["symbol"]
+        }
+      }
+    }
+  ],
+  "tool_handlers": {
+    "analyze_quant_stock_strategy": "quant_stock_strategy_advisor"
+  }
+}
