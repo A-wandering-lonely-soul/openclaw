@@ -408,7 +408,13 @@ TOOLS = [
 ]
 
 WEB_FRONTEND_ENTRY = "web_frontend"
-WEB_FRONTEND_ALLOWED_TOOL_NAMES = {"schedule_task"}
+WEB_FRONTEND_ALLOWED_TOOL_NAMES = {
+    "schedule_task",
+    "list_tasks",
+    "remove_task",
+    "get_stock_price",
+    "get_gold_price",
+}
 
 # ─── 工具实现 ─────────────────────────────────────────────────────────────────
 
@@ -695,6 +701,40 @@ def tool_get_stock_price(symbol: str) -> str:
             f"成交量：{volume} 手  成交额：{amount} 元"
         )
 
+    def _fetch_eastmoney_snapshot(code6: str):
+        """返回东方财富行情快照（当日口径），失败时返回 None。"""
+        if not re.fullmatch(r"\d{6}", code6):
+            return None
+        secid = f"{'1' if code6.startswith('6') else '0'}.{code6}"
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "secid": secid,
+            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170",
+            "invt": "2",
+            "fltt": "2",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        resp = http_requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        if not data:
+            return None
+        return {
+            "name": data.get("f58", code6),
+            "code": data.get("f57", code6),
+            "latest": _normalize_price(data.get("f43")),
+            "pct": _normalize_pct(data.get("f170")),
+            "open_p": _normalize_price(data.get("f46")),
+            "pre_close": _normalize_price(data.get("f60")),
+            "high": _normalize_price(data.get("f44")),
+            "low": _normalize_price(data.get("f45")),
+            "volume": data.get("f47", "N/A"),
+            "amount": data.get("f48", "N/A"),
+        }
+
     symbol = (symbol or "").strip()
     if not symbol:
         return "股价查询失败: symbol 不能为空"
@@ -731,6 +771,13 @@ def tool_get_stock_price(symbol: str) -> str:
                 try:
                     quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=5)
                     if quote_df is not None and not quote_df.empty:
+                        sort_col = None
+                        for c in ("trade_time", "datetime", "trade_date", "date"):
+                            if c in quote_df.columns:
+                                sort_col = c
+                                break
+                        if sort_col:
+                            quote_df = quote_df.sort_values(by=sort_col, ascending=True)
                         row = quote_df.iloc[-1]
                         data_time = (
                             row.get("trade_time")
@@ -739,6 +786,32 @@ def tool_get_stock_price(symbol: str) -> str:
                             or row.get("date")
                             or "N/A"
                         )
+                        # 分钟K线的 high/low 仅代表该分钟，不等于当日最高/最低。
+                        # 若可获取当日快照，则优先返回当日口径，避免与券商/行情APP口径不一致。
+                        day_snapshot = None
+                        try:
+                            day_snapshot = _fetch_eastmoney_snapshot(code)
+                        except Exception:
+                            logger.exception("[stock] eastmoney calibration failed code=%s", code)
+
+                        if day_snapshot:
+                            return _format_result(
+                                name=day_snapshot.get("name", name),
+                                code=day_snapshot.get("code", code),
+                                latest=day_snapshot.get("latest", row.get("close", "N/A")),
+                                pct=day_snapshot.get("pct", "N/A"),
+                                open_p=day_snapshot.get("open_p", row.get("open", "N/A")),
+                                pre_close=day_snapshot.get("pre_close", row.get("pre_close", "N/A")),
+                                high=day_snapshot.get("high", "N/A"),
+                                low=day_snapshot.get("low", "N/A"),
+                                volume=day_snapshot.get("volume", row.get("vol", "N/A")),
+                                amount=day_snapshot.get("amount", row.get("amount", "N/A")),
+                                source="Tushare Pro + 东方财富快照校准",
+                                granularity="行情快照（当日）",
+                                data_time=str(data_time),
+                                fallback_note=fallback_note,
+                            )
+
                         pre_close = row.get("pre_close", "N/A")
                         close = row.get("close", "N/A")
                         pct = "N/A"
@@ -756,8 +829,12 @@ def tool_get_stock_price(symbol: str) -> str:
                             volume=row.get("vol", "N/A"),
                             amount=row.get("amount", "N/A"),
                             source="Tushare Pro",
-                            granularity="1分钟K线",
+                            granularity="1分钟K线（高低为该分钟）",
                             data_time=str(data_time),
+                            fallback_note=(
+                                (fallback_note + "；" if fallback_note else "") +
+                                "当前为分钟K线口径，最高/最低为该分钟，不是当日最高/最低"
+                            ),
                         )
                     logger.warning("[stock] tushare 1min returned empty ts_code=%s", ts_code)
                 except Exception:
@@ -832,23 +909,21 @@ def tool_get_stock_price(symbol: str) -> str:
         last_err = None
         for _ in range(3):
             try:
-                resp = http_requests.get(url, params=params, headers=headers, timeout=10)
-                resp.raise_for_status()
-                data = resp.json().get("data") or {}
-                if not data:
+                snapshot = _fetch_eastmoney_snapshot(symbol)
+                if not snapshot:
                     raise ValueError("东方财富返回空数据")
 
                 return _format_result(
-                    name=data.get("f58", symbol),
-                    code=data.get("f57", symbol),
-                    latest=_normalize_price(data.get("f43")),
-                    pct=_normalize_pct(data.get("f170")),
-                    open_p=_normalize_price(data.get("f46")),
-                    pre_close=_normalize_price(data.get("f60")),
-                    high=_normalize_price(data.get("f44")),
-                    low=_normalize_price(data.get("f45")),
-                    volume=data.get("f47", "N/A"),
-                    amount=data.get("f48", "N/A"),
+                    name=snapshot.get("name", symbol),
+                    code=snapshot.get("code", symbol),
+                    latest=snapshot.get("latest", "N/A"),
+                    pct=snapshot.get("pct", "N/A"),
+                    open_p=snapshot.get("open_p", "N/A"),
+                    pre_close=snapshot.get("pre_close", "N/A"),
+                    high=snapshot.get("high", "N/A"),
+                    low=snapshot.get("low", "N/A"),
+                    volume=snapshot.get("volume", "N/A"),
+                    amount=snapshot.get("amount", "N/A"),
                     source="东方财富直连",
                     granularity="行情快照",
                     data_time="N/A",
@@ -1164,21 +1239,26 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
         )
     elif web_mode:
         principle_1 = "1. 用户说\"帮我做某事\"时，在能力范围内直接执行。"
-        execution_rule = "2. 网页入口模式下，仅可调用 schedule_task 创建定时任务。"
+        execution_rule = "2. 网页入口模式下，可调用定时任务与行情工具（schedule_task/list_tasks/remove_task/get_stock_price/get_gold_price）。"
         capability_lines = (
             "- schedule_task：创建 cron 定时任务（禁止特权命令，普通命令均可）\n"
+            "- list_tasks：列出已有定时任务\n"
+            "- remove_task：删除指定定时任务\n"
+            "- get_stock_price：查询 A 股实时行情（支持代码或名称）\n"
+            "- get_gold_price：查询黄金现货价格（默认 Au99.99）\n"
         )
         policy_lines = (
-            "3. 网页入口严格受限：只允许创建定时任务；禁止系统控制、禁止读写文件、禁止网络抓取。\n"
+            "3. 网页入口受限：允许定时任务管理与行情查询；禁止系统控制、禁止读写文件、禁止任意网络抓取。\n"
             "4. 定时命令禁止使用 sudo/systemctl/docker 等特权命令，普通 shell 命令均可。\n"
             "5. 网页入口无法收到推送通知，不要设置 notify_chat_id；如需在任务执行后收到通知，请通过 Telegram Bot 使用。\n"
             "6. cron 是周期性任务，无法做到“仅执行一次”。若用户说“X 分钟后提醒”，需换算到具体时分，"
             "告知用户任务将在该时刻及此后每天同一时刻重复触发，并询问是否接受后再创建。\n"
             "7. 遇到错误要基于工具输出解释原因并给出可执行修正方案。\n"
             "8. 任务完成后简洁告知用户任务名称、cron 表达式、下次执行时间（北京时间）。\n"
-            "9. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
-            "10. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "11. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "9. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price，不要擅自改成定时任务。\n"
+            "10. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "11. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "12. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     else:
         principle_1 = "1. 用户说\"帮我做某事\"时，直接动手执行，不要只给文字建议。"
@@ -1485,11 +1565,21 @@ def chat():
                     )
         else:
             search_result = do_search(search_query)
+            if not search_result and is_weather_query(prompt):
+                fallback_query = build_weather_fallback_query(prompt)
+                logger.info(f"[SEARCH] Empty result, retry with fallback query='{fallback_query}'")
+                search_result = do_search(fallback_query)
             if search_result:
                 user_content = (
                     f"以下是搜索引擎获取的实时信息，请基于这些信息回答用户问题：\n\n"
                     f"{weather_guard}"
                     f"{search_result}\n\n"
+                    f"用户问题：{prompt}"
+                )
+            elif is_weather_query(prompt):
+                user_content = (
+                    "以下是系统状态说明：已尝试联网搜索天气，但未检索到可用结果。"
+                    "请明确告诉用户当前无法确认实时天气，避免编造。\n\n"
                     f"用户问题：{prompt}"
                 )
 
