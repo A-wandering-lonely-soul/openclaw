@@ -6,7 +6,8 @@
 **主要功能：**
 - 支持多模型切换（GitHub Copilot GPT-4.1 / gpt-4o 等、DeepSeek V3 / R1）
 - 自动联网搜索（Tavily），问到实时信息时自动查询
-- A股行情多通道查询（Tushare Pro 优先，失败自动切换 AKShare/东方财富/腾讯兜底）
+- A股行情多通道查询（**Sina Finance 直连**优先，失败自动切换东方财富/AKShare 兜底；支持股票/指数/ETF）
+- 网页端自选股列表**按用户持久化至 PostgreSQL**，多设备/多浏览器保持一致
 - Skill 插件机制（第一版）：支持从本地目录加载 skill.json，动态扩展工具与系统提示
 - 聊天上下文采用 Redis（热缓存）+ PostgreSQL（持久化）
 - 支持 Telegram Bot 和飞书机器人双渠道接入
@@ -250,9 +251,10 @@ docker compose exec postgres psql -U openclaw -d openclaw
 \dt
 ```
 
-预期能看到两张表：
+预期能看到三张表：
 - `chat_sessions`
 - `chat_messages`
+- `user_watchlist`（网页端自选股，按用户隔离）
 
 查看最近会话：
 
@@ -606,12 +608,26 @@ docker logs -f feishu_bot
 cd ~/openclaw
 ./deploy.sh
 
-# 重新部署（代码更新后，--no-cache 确保新代码生效）
+# 增量更新后端（仅重建 openclaw 服务，利用 BuildKit pip 缓存，速度较快）
 cd ~/openclaw
-docker compose build --no-cache
-docker compose up -d
+git pull
+docker compose build openclaw
+docker compose up -d openclaw
 
-# nginx 前置模式重新部署
+# 增量更新前端静态资源（部署在 nginx 静态目录的情况）
+cd ~/openclaw-web
+git pull
+npm install
+npm run build
+# 将 dist/ 内容复制到你的 nginx 静态目录（路径按实际配置替换）
+sudo cp -r dist/* /var/www/openclaw-web/
+
+# 完整重建后端（依赖变更或需清缓存时）
+cd ~/openclaw
+docker compose build --no-cache openclaw
+docker compose up -d openclaw
+
+# nginx 前置模式完整重建
 cd ~/openclaw
 docker compose -f docker-compose.yml -f docker-compose.nginx.yml build --no-cache
 docker compose -f docker-compose.yml -f docker-compose.nginx.yml up -d
@@ -643,9 +659,9 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 - 消息里需含有触发关键词（最新、今天、天气、新闻等）
 
 **Q: A股查询失败或返回过旧数据**
-- 当前实现为多通道：优先 `Tushare Pro`，失败自动切 `AKShare` -> `东方财富直连 API` -> `腾讯行情直连`
-- 若输入股票名称且兜底链路触发，建议改用 6 位股票代码（如 `600256`）以提高成功率
-- 可在容器内自检：`docker exec -i openclaw_service python -c "import akshare as ak; print(len(ak.stock_zh_a_spot_em()))"`
+- 当前实现为三通道：优先 **Sina Finance 直连**（`hq.sinajs.cn`），失败自动切 `东方财富` -> `AKShare ETF 兜底`
+- 建议使用 6 位代码（如 `000001`、`512660`），指数前缀规则：`000xxx`/`5/6xxxx` 对应上交所，`399xxx`/`0/1/2/3xxxx` 对应深交所
+- 若 Sina Finance 被屏蔽，可在容器内自检东方财富：`docker exec -i openclaw_service curl -s 'https://push2.eastmoney.com/api/qt/stock/get?secid=1.600519&fields=f43' | head -c 200`
 - 若修改过 `run_server.py` 后未生效，执行：`docker compose restart openclaw`
 
 **Q: 运行 `openclaw-box` 报错 `Permission denied`**
@@ -671,3 +687,12 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 - 运行 `docker logs -f feishu_bot` 查看错误
 - 检查 `.env` 中 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 是否填写正确
 - 检查飞书应用是否已开启 `im:message` 权限并发布上线
+
+**Q: 网页端自选股换设备/浏览器后丢失**
+- v2 之前自选股存在 localStorage，换设备即丢失
+- 当前版本已改为存储在 PostgreSQL（`user_watchlist` 表），与账号绑定，多端共享
+- 旧版 localStorage 数据不会自动迁移；首次登录时若数据库无记录，会加载默认板块 ETF
+
+**Q: 更新后自选股 API 报 404**
+- 后端服务需重启以加载新代码：`docker compose up -d openclaw`
+- `user_watchlist` 表由 `init_storage()` 自动创建（`CREATE TABLE IF NOT EXISTS`），无需手动执行 SQL

@@ -5,8 +5,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 
 COPY openclaw/requirements.txt .
-RUN pip install --upgrade pip
-RUN pip install --retries 5 --timeout 120 -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    --retries 8 --timeout 180 -r requirements.txt
 
 COPY openclaw /app/openclaw
 

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import json
 import shlex
@@ -138,6 +138,25 @@ def init_storage():
             ON chat_messages(chat_id, id)
             """
         )
+        # 迁移：为 chat_sessions 补充 username / title 列（兼容已有数据）
+        cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS username TEXT")
+        cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS title TEXT")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_sessions_username ON chat_sessions(username)"
+        )
+        # 用户自选股票表
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_watchlist (
+                username TEXT NOT NULL,
+                symbol   TEXT NOT NULL,
+                kind     TEXT NOT NULL DEFAULT 'stock',
+                label    TEXT,
+                position INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (username, symbol)
+            )
+            """
+        )
 
 
 def init_storage_with_retry(max_attempts: int = 20, delay_seconds: float = 1.5):
@@ -204,25 +223,35 @@ def load_chat_history(chat_id: str) -> list:
     return history
 
 
-def persist_chat_delta(chat_id: str, entry: str, messages: list):
+def persist_chat_delta(chat_id: str, entry: str, messages: list, *, username: str = "", title: str = ""):
     if not messages:
         return
 
     conn = get_pg_conn()
     normalized_entry = entry.strip() if isinstance(entry, str) else ""
+    normalized_username = username.strip() if isinstance(username, str) else ""
+    normalized_title = title.strip() if isinstance(title, str) else ""
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO chat_sessions(chat_id, entry, updated_at)
-            VALUES (%s, %s, NOW())
+            INSERT INTO chat_sessions(chat_id, entry, username, title, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
             ON CONFLICT (chat_id) DO UPDATE SET
                 entry = CASE
                     WHEN EXCLUDED.entry IS NULL OR EXCLUDED.entry = '' THEN chat_sessions.entry
                     ELSE EXCLUDED.entry
                 END,
+                username = CASE
+                    WHEN EXCLUDED.username IS NULL OR EXCLUDED.username = '' THEN chat_sessions.username
+                    ELSE EXCLUDED.username
+                END,
+                title = CASE
+                    WHEN EXCLUDED.title IS NULL OR EXCLUDED.title = '' THEN chat_sessions.title
+                    ELSE EXCLUDED.title
+                END,
                 updated_at = NOW()
             """,
-            (chat_id, normalized_entry or None),
+            (chat_id, normalized_entry or None, normalized_username or None, normalized_title or None),
         )
         for msg in messages:
             cur.execute(
@@ -2129,6 +2158,8 @@ def chat():
     prompt = data.get("prompt", "")
     chat_id = str(data.get("chat_id", "default"))
     entry = str(data.get("entry", "")).strip()
+    username = str(data.get("username", "")).strip()
+    title = str(data.get("title", "")).strip()
     logger.info(f"[CHAT] prompt='{prompt[:80]}' provider={current_config['provider']} model={current_config['model']}")
 
     history = load_chat_history(chat_id)
@@ -2224,7 +2255,7 @@ def chat():
                 "建议切换到 qwen2.5:3b 后再试（如需 llama3.2:3b 请先手动 ollama pull）；复杂/联网任务也建议改用 Copilot。"
             )
             history.append({"role": "assistant", "content": warn_reply})
-            persist_chat_delta(chat_id, entry, history[history_start_idx:])
+            persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
             return jsonify({"response": warn_reply})
 
     user_msg_idx = len(history)
@@ -2242,7 +2273,7 @@ def chat():
         history.append({"role": "user", "content": user_content})
         warn_reply = f"⚠️ 当前模型 [{current_config['model']}] 不支持图片识别，请切换到 gpt-4o 或 gpt-4o-mini 后再发图片。"
         history.append({"role": "assistant", "content": warn_reply})
-        persist_chat_delta(chat_id, entry, history[history_start_idx:])
+        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
         return jsonify({"response": warn_reply})
     else:
         history.append({"role": "user", "content": user_content})
@@ -2273,7 +2304,7 @@ def chat():
             reply = normalize_reply_for_entry(reply, entry)
             history[user_msg_idx] = {"role": "user", "content": restore_prompt}
             history.append({"role": "assistant", "content": reply})
-            persist_chat_delta(chat_id, entry, history[history_start_idx:])
+            persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
             return jsonify({"response": reply})
 
         # Agent 循环：最多 10 轮工具调用
@@ -2328,13 +2359,13 @@ def chat():
                 reply = normalize_reply_for_entry(reply, entry)
                 history[user_msg_idx] = {"role": "user", "content": restore_prompt}
                 history.append({"role": "assistant", "content": reply})
-                persist_chat_delta(chat_id, entry, history[history_start_idx:])
+                persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
                 return jsonify({"response": reply})
 
         # 超过最大轮次
         reply = "⚠️ Agent 执行轮次已达上限，任务可能未完全完成，请重新描述或继续追问。"
         history.append({"role": "assistant", "content": reply})
-        persist_chat_delta(chat_id, entry, history[history_start_idx:])
+        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
         return jsonify({"response": reply})
 
     except Exception as e:
@@ -2491,6 +2522,417 @@ def clear_context_by_entry():
         return jsonify({"error": f"不支持的 entry: {target_entry}，必须是 all/web_frontend/telegram/feishu"}), 400
     
     return jsonify({"status": "ok", "cleared_count": cleared_count, "cleared_entry": target_entry})
+
+
+# ──────────────────── 行情数据（REST API 专用，返回结构化 JSON）────────────────
+
+# 主要 A 股指数代码集合（需走指数 API，不能走股票 API）
+_A_MAJOR_INDEX_CODES = frozenset({
+    "000001",  # 上证综指
+    "000300",  # 沪深300
+    "000016",  # 上证50
+    "000905",  # 中证500
+    "000852",  # 中证1000
+    "000688",  # 科创50
+    "399001",  # 深证成指
+    "399006",  # 创业板指
+    "399300",  # 沪深300(深)
+    "399905",  # 中证500(深)
+    "000010",  # 上证180
+    "000015",  # 红利指数
+})
+
+
+def fetch_stock_quote_json(symbol: str) -> dict:
+    """获取股票/ETF/指数行情快照，返回结构化字典。
+
+    数据源优先级：
+      1) 新浪财经 hq.sinajs.cn  ← 最稳、最快，支持股票/ETF/指数
+      2) 东方财富 push2         ← 新浪失败时备用
+      3) AKShare fund_etf_spot_em ← ETF 终极兜底
+    """
+    symbol = (symbol or "").strip()
+    if not symbol:
+        return {"error": "symbol 不能为空"}
+
+    def _f(v):
+        """安全转 float，0 或空串返回 None"""
+        try:
+            f = float(v)
+            return f if f != 0 else None
+        except Exception:
+            return None
+
+    # ── 1) 新浪财经（股票/ETF/指数统一接口）──────────────────────────────────
+    # 确定新浪市场前缀
+    is_index = symbol in _A_MAJOR_INDEX_CODES or symbol.startswith("399")
+    if is_index:
+        sina_prefix = "sz" if symbol.startswith("399") else "sh"
+    else:
+        # 5/6 开头为上交所（含 ETF）；0/1/2/3 开头为深交所
+        sina_prefix = "sh" if symbol[0] in ("5", "6") else "sz"
+    sina_code = f"{sina_prefix}{symbol}"
+
+    try:
+        url = f"https://hq.sinajs.cn/list={sina_code}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://finance.sina.com.cn/",
+        }
+        resp = http_requests.get(url, headers=headers, timeout=8)
+        resp.raise_for_status()
+        # 返回示例: var hq_str_sh000001="上证指数,3245.63,3240.73,3269.06,..."
+        m = re.search(r'hq_str_\w+="([^"]+)"', resp.text)
+        if m:
+            fields = m.group(1).split(",")
+            name = fields[0].strip() if fields else ""
+            price = _f(fields[3]) if len(fields) > 3 else None
+            pre_close = _f(fields[2]) if len(fields) > 2 else None
+            if name and price is not None:
+                pct = (
+                    round((price - pre_close) / pre_close * 100, 2)
+                    if pre_close and pre_close != 0
+                    else None
+                )
+                data_time = None
+                if len(fields) > 31 and fields[30] and fields[31]:
+                    data_time = f"{fields[30]} {fields[31]}"
+                return {
+                    "name": name,
+                    "code": symbol,
+                    "latest": price,
+                    "pct_change": pct,
+                    "open": _f(fields[1]) if len(fields) > 1 else None,
+                    "pre_close": pre_close,
+                    "high": _f(fields[4]) if len(fields) > 4 else None,
+                    "low": _f(fields[5]) if len(fields) > 5 else None,
+                    "volume": _f(fields[8]) if len(fields) > 8 else None,
+                    "amount": _f(fields[9]) if len(fields) > 9 else None,
+                    "source": "新浪财经",
+                    "granularity": "行情快照",
+                    "data_time": data_time,
+                }
+    except Exception:
+        logger.exception("[market/stock] sina failed symbol=%s", symbol)
+
+    # ── 2) 东方财富直连（新浪失败备用）──────────────────────────────────────
+    if re.fullmatch(r"\d{6}", symbol):
+        try:
+            if is_index:
+                em_market = "0" if symbol.startswith("399") else "1"
+            else:
+                em_market = "1" if symbol[0] in ("5", "6") else "0"
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                "secid": f"{em_market}.{symbol}",
+                "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170",
+                "invt": "2", "fltt": "2",
+            }
+            headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+            resp = http_requests.get(url, params=params, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            if data and data.get("f58"):
+                def _p(v):
+                    try: return round(float(v) / 100, 2) if float(v) != 0 else None
+                    except: return None
+                return {
+                    "name": data.get("f58") or symbol,
+                    "code": symbol,
+                    "latest": _p(data.get("f43")),
+                    "pct_change": _p(data.get("f170")),
+                    "open": _p(data.get("f46")),
+                    "pre_close": _p(data.get("f60")),
+                    "high": _p(data.get("f44")),
+                    "low": _p(data.get("f45")),
+                    "volume": data.get("f47"),
+                    "amount": data.get("f48"),
+                    "source": "东方财富",
+                    "granularity": "行情快照",
+                    "data_time": None,
+                }
+        except Exception:
+            logger.exception("[market/stock] eastmoney failed symbol=%s", symbol)
+
+    # ── 3) AKShare ETF 兜底 ────────────────────────────────────────────────
+    try:
+        import akshare as ak
+        df_etf = ak.fund_etf_spot_em()
+        if df_etf is not None and not df_etf.empty:
+            row_df = df_etf[df_etf["代码"] == symbol]
+            if not row_df.empty:
+                row = row_df.iloc[0]
+                def _tf(v):
+                    try: return float(v)
+                    except: return None
+                return {
+                    "name": str(row.get("名称", symbol)),
+                    "code": symbol,
+                    "latest": _tf(row.get("最新价")),
+                    "pct_change": _tf(row.get("涨跌幅")),
+                    "open": _tf(row.get("今开")),
+                    "pre_close": _tf(row.get("昨收")),
+                    "high": _tf(row.get("最高")),
+                    "low": _tf(row.get("最低")),
+                    "volume": row.get("成交量"),
+                    "amount": row.get("成交额"),
+                    "source": "AKShare/ETF",
+                    "granularity": "行情快照",
+                    "data_time": None,
+                }
+    except Exception:
+        logger.exception("[market/stock] akshare ETF fallback failed symbol=%s", symbol)
+
+    return {"error": f"未找到：{symbol}"}
+
+
+def fetch_gold_quote_json(symbol: str = "Au99.99") -> dict:
+    """获取黄金行情，返回结构化字典（供前端 REST API 消费）。"""
+    import akshare as ak
+    symbol = (symbol or "Au99.99").strip() or "Au99.99"
+
+    def _to_float(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            sv = str(v).strip()
+            return float(sv) if sv not in ("", "N/A") else None
+        except Exception:
+            return None
+
+    # 1) 上海金交所现货分钟行情
+    try:
+        df = ak.spot_quotations_sge(symbol=symbol)
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
+            price = None
+            for k in ["现价", "最新价", "价格", "close", "Close", "现货价", "成交价"]:
+                v = latest.get(k)
+                if v is not None:
+                    price = _to_float(v)
+                    if price is not None:
+                        break
+            update_time = None
+            for k in ["更新时间", "时间", "datetime", "date"]:
+                v = latest.get(k)
+                if v is not None:
+                    update_time = str(v)
+                    break
+            if price is not None:
+                return {
+                    "symbol": symbol,
+                    "latest": price,
+                    "source": "上海金交所现货",
+                    "granularity": "分钟级/近实时",
+                    "data_time": update_time,
+                    "is_historical": False,
+                }
+    except Exception:
+        logger.exception("[market/gold] spot_quotations_sge failed symbol=%s", symbol)
+
+    # 2) 沪金期货实时参考
+    for mkt in ["CF", ""]:
+        try:
+            df = ak.futures_zh_spot(symbol="沪金", market=mkt) if mkt else ak.futures_zh_spot(symbol="沪金")
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                return {
+                    "symbol": symbol,
+                    "latest": _to_float(row.get("最新价", row.get("price"))),
+                    "change": _to_float(row.get("涨跌")),
+                    "pct_change": _to_float(row.get("涨跌幅")),
+                    "source": "沪金期货实时参考",
+                    "granularity": "实时参考",
+                    "data_time": None,
+                    "is_historical": False,
+                }
+        except Exception:
+            pass
+
+    # 3) SGE 历史日线兜底
+    try:
+        df = ak.spot_hist_sge(symbol=symbol)
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
+            return {
+                "symbol": symbol,
+                "latest": _to_float(latest.get("收盘价", latest.get("close"))),
+                "high": _to_float(latest.get("最高价", latest.get("high"))),
+                "low": _to_float(latest.get("最低价", latest.get("low"))),
+                "data_time": str(latest.get("日期", "")),
+                "source": "上海金交所历史收盘",
+                "granularity": "历史日线",
+                "is_historical": True,
+            }
+    except Exception:
+        logger.exception("[market/gold] spot_hist_sge failed symbol=%s", symbol)
+
+    return {"error": "黄金价格查询失败"}
+
+
+# ──────────────────── 用户认证 ────────────────────
+# 固定用户表（不做持久化，硬编码两个账号即可）
+_USERS = {
+    "admin":   {"password": "123456",  "role": "guest",  "display_name": "游客"},
+    "manager": {"password": "1111011", "role": "admin",  "display_name": "管理员"},
+}
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.json or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    user = _USERS.get(username)
+    if not user or user["password"] != password:
+        return jsonify({"message": "用户名或密码错误"}), 401
+    return jsonify({
+        "role": user["role"],
+        "username": username,
+        "display_name": user["display_name"],
+    })
+
+
+# ──────────────────── 聊天会话管理 API ────────────────────
+
+@app.route("/api/sessions", methods=["GET"])
+def list_sessions():
+    """列出指定用户的历史会话（按最后更新时间倒序，最多 50 条）。"""
+    username = request.args.get("username", "").strip()
+    if not username:
+        return jsonify({"error": "username 不能为空"}), 400
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT chat_id, title, updated_at
+            FROM chat_sessions
+            WHERE username = %s
+            ORDER BY updated_at DESC
+            LIMIT 50
+            """,
+            (username,),
+        )
+        rows = cur.fetchall()
+    sessions = [
+        {
+            "chat_id": r[0],
+            "title": r[1] or "未命名会话",
+            "updated_at": r[2].isoformat() if r[2] else "",
+        }
+        for r in rows
+    ]
+    return jsonify({"sessions": sessions})
+
+
+@app.route("/api/sessions/<chat_id>/messages", methods=["GET"])
+def get_session_messages(chat_id):
+    """获取指定会话的消息列表（仅 user/assistant 角色，供前端回显）。"""
+    if not chat_id:
+        return jsonify({"error": "chat_id 不能为空"}), 400
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content, created_at
+            FROM chat_messages
+            WHERE chat_id = %s AND role IN ('user', 'assistant')
+            ORDER BY id ASC
+            """,
+            (chat_id,),
+        )
+        rows = cur.fetchall()
+    messages = []
+    for idx, (role, content, created_at) in enumerate(rows):
+        # content 为 JSONB，可能是字符串或多模态列表
+        if isinstance(content, list):
+            text = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+            content = text
+        elif not isinstance(content, str):
+            content = str(content)
+        messages.append({
+            "id": f"srv-{chat_id[:8]}-{idx}",
+            "role": role,
+            "content": content,
+            "createdAt": created_at.isoformat() if created_at else datetime.now().isoformat(),
+        })
+    return jsonify({"messages": messages})
+
+
+# ──────────────────── 行情 API ────────────────────
+
+@app.route("/api/market/quote", methods=["GET"])
+def market_quote():
+    """行情快照接口。kind=stock（默认）或 kind=gold。"""
+    symbol = request.args.get("symbol", "").strip()
+    kind = request.args.get("kind", "stock").strip().lower()
+    if not symbol:
+        return jsonify({"error": "symbol 不能为空"}), 400
+    if kind == "gold":
+        result = fetch_gold_quote_json(symbol)
+    else:
+        result = fetch_stock_quote_json(symbol)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+# ──────────────────── 自选行情 API ────────────────────
+
+@app.route("/api/watchlist", methods=["GET"])
+def get_watchlist():
+    """获取用户自选列表，按 position 升序。"""
+    username = request.args.get("username", "").strip()
+    if not username:
+        return jsonify({"error": "username 不能为空"}), 400
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT symbol, kind, label, position
+            FROM user_watchlist
+            WHERE username = %s
+            ORDER BY position ASC
+            """,
+            (username,),
+        )
+        rows = cur.fetchall()
+    items = [{"symbol": r[0], "kind": r[1], "label": r[2], "position": r[3]} for r in rows]
+    return jsonify({"items": items})
+
+
+@app.route("/api/watchlist", methods=["PUT"])
+def save_watchlist():
+    """全量覆盖保存用户自选列表（传入 username + items 数组）。"""
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip()
+    items = data.get("items", [])
+    if not username:
+        return jsonify({"error": "username 不能为空"}), 400
+    if not isinstance(items, list):
+        return jsonify({"error": "items 必须是数组"}), 400
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM user_watchlist WHERE username = %s", (username,))
+        for idx, item in enumerate(items):
+            sym = (item.get("symbol") or "").strip()
+            kind = (item.get("kind") or "stock").strip()
+            label = (item.get("label") or None)
+            if not sym:
+                continue
+            cur.execute(
+                """
+                INSERT INTO user_watchlist(username, symbol, kind, label, position)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (username, symbol) DO UPDATE
+                SET kind=EXCLUDED.kind, label=EXCLUDED.label, position=EXCLUDED.position
+                """,
+                (username, sym, kind, label, idx),
+            )
+    conn.commit()
+    return jsonify({"status": "ok", "saved": len(items)})
 
 
 @app.route("/api/set_model", methods=["POST"])
