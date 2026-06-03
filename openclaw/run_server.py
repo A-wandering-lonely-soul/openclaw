@@ -6,6 +6,9 @@ import subprocess
 import time
 import shutil
 import tempfile
+import secrets
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
@@ -56,6 +59,8 @@ current_config = {
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 REDIS_CHAT_TTL_SECONDS = int(os.getenv("REDIS_CHAT_TTL_SECONDS", "604800"))
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://openclaw:openclaw@postgres:5432/openclaw")
+AUTH_PASSWORD_PEPPER = os.getenv("AUTH_PASSWORD_PEPPER", "openclaw-dev-pepper")
+AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "30"))
 
 redis_client = None
 pg_conn = None
@@ -87,6 +92,96 @@ APP_TIMEZONE_NAME = "Asia/Shanghai"
 # 不支持 vision 图片输入的模型
 VISION_UNSUPPORTED_MODELS = {"gpt-4.1", "o3-mini", "o1-mini", "deepseek-chat", "deepseek-reasoner"}
 
+DEFAULT_USERS = [
+    {"username": "admin", "password": "123456", "role": "guest", "display_name": "游客"},
+    {"username": "manager", "password": "1111011", "role": "admin", "display_name": "管理员"},
+]
+
+
+def _hash_password(password: str) -> str:
+    raw = f"{AUTH_PASSWORD_PEPPER}:{password}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _seed_default_users(cur):
+    for user in DEFAULT_USERS:
+        cur.execute(
+            """
+            INSERT INTO users(username, password_hash, role, display_name)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (username) DO NOTHING
+            """,
+            (
+                user["username"],
+                _hash_password(user["password"]),
+                user["role"],
+                user["display_name"],
+            ),
+        )
+
+
+def _issue_auth_token(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_token(token)
+    expires_at = datetime.utcnow() + timedelta(days=AUTH_TOKEN_TTL_DAYS)
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO user_tokens(user_id, token_hash, expires_at)
+            VALUES (%s, %s, %s)
+            """,
+            (user_id, token_hash, expires_at),
+        )
+    return token
+
+
+def _extract_bearer_token() -> str:
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+
+def _get_current_user():
+    token = _extract_bearer_token()
+    if not token:
+        return None
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT u.id, u.username, u.role, u.display_name
+            FROM user_tokens t
+            JOIN users u ON u.id = t.user_id
+            WHERE t.token_hash = %s
+              AND t.expires_at > NOW()
+            """,
+            (_hash_token(token),),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "username": row[1],
+        "role": row[2],
+        "display_name": row[3],
+    }
+
+
+def _require_auth_user(*, admin_only: bool = False):
+    user = _get_current_user()
+    if not user:
+        return None, (jsonify({"error": "未登录或登录已过期"}), 401)
+    if admin_only and user["role"] != "admin":
+        return None, (jsonify({"error": "无权限"}), 403)
+    return user, None
+
 
 def redis_history_key(chat_id: str) -> str:
     return f"openclaw:chat:history:{chat_id}"
@@ -110,6 +205,35 @@ def init_storage():
     # PostgreSQL: 持久化会话与消息
     conn = get_pg_conn()
     with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('guest', 'admin')),
+                display_name TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_tokens (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id ON user_tokens(user_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_tokens_expires_at ON user_tokens(expires_at)"
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -140,9 +264,13 @@ def init_storage():
         )
         # 迁移：为 chat_sessions 补充 username / title 列（兼容已有数据）
         cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS username TEXT")
+        cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_id BIGINT")
         cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS title TEXT")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_sessions_username ON chat_sessions(username)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id)"
         )
         # 用户自选股票表
         cur.execute(
@@ -157,6 +285,35 @@ def init_storage():
             )
             """
         )
+        cur.execute("ALTER TABLE user_watchlist ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_watchlist_user_id ON user_watchlist(user_id)"
+        )
+
+        _seed_default_users(cur)
+
+        # 兼容旧数据：由 username 回填 user_id
+        cur.execute(
+            """
+            UPDATE chat_sessions s
+            SET user_id = u.id
+            FROM users u
+            WHERE s.user_id IS NULL
+              AND s.username = u.username
+            """
+        )
+        cur.execute(
+            """
+            UPDATE user_watchlist w
+            SET user_id = u.id
+            FROM users u
+            WHERE w.user_id IS NULL
+              AND w.username = u.username
+            """
+        )
+
+        # 清理过期 token
+        cur.execute("DELETE FROM user_tokens WHERE expires_at <= NOW()")
 
 
 def init_storage_with_retry(max_attempts: int = 20, delay_seconds: float = 1.5):
@@ -223,7 +380,7 @@ def load_chat_history(chat_id: str) -> list:
     return history
 
 
-def persist_chat_delta(chat_id: str, entry: str, messages: list, *, username: str = "", title: str = ""):
+def persist_chat_delta(chat_id: str, entry: str, messages: list, *, username: str = "", user_id=None, title: str = ""):
     if not messages:
         return
 
@@ -234,8 +391,8 @@ def persist_chat_delta(chat_id: str, entry: str, messages: list, *, username: st
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO chat_sessions(chat_id, entry, username, title, updated_at)
-            VALUES (%s, %s, %s, %s, NOW())
+            INSERT INTO chat_sessions(chat_id, entry, username, user_id, title, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             ON CONFLICT (chat_id) DO UPDATE SET
                 entry = CASE
                     WHEN EXCLUDED.entry IS NULL OR EXCLUDED.entry = '' THEN chat_sessions.entry
@@ -245,13 +402,14 @@ def persist_chat_delta(chat_id: str, entry: str, messages: list, *, username: st
                     WHEN EXCLUDED.username IS NULL OR EXCLUDED.username = '' THEN chat_sessions.username
                     ELSE EXCLUDED.username
                 END,
+                user_id = COALESCE(EXCLUDED.user_id, chat_sessions.user_id),
                 title = CASE
                     WHEN EXCLUDED.title IS NULL OR EXCLUDED.title = '' THEN chat_sessions.title
                     ELSE EXCLUDED.title
                 END,
                 updated_at = NOW()
             """,
-            (chat_id, normalized_entry or None, normalized_username or None, normalized_title or None),
+            (chat_id, normalized_entry or None, normalized_username or None, user_id, normalized_title or None),
         )
         for msg in messages:
             cur.execute(
@@ -276,10 +434,13 @@ def persist_chat_delta(chat_id: str, entry: str, messages: list, *, username: st
     pipe.execute()
 
 
-def clear_chat_context(chat_id: str):
+def clear_chat_context(chat_id: str, *, user_id=None):
     conn = get_pg_conn()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM chat_sessions WHERE chat_id = %s", (chat_id,))
+        if user_id is None:
+            cur.execute("DELETE FROM chat_sessions WHERE chat_id = %s", (chat_id,))
+        else:
+            cur.execute("DELETE FROM chat_sessions WHERE chat_id = %s AND user_id = %s", (chat_id, user_id))
     redis_client.delete(redis_history_key(chat_id))
 
 
@@ -886,240 +1047,83 @@ def tool_get_stock_price(symbol: str) -> str:
     logger.info("[stock] query start symbol=%s", symbol)
     fallback_note = ""
 
-    # 0) 主数据源：Tushare Pro（需要设置 TUSHARE_TOKEN）
-    tushare_token = os.getenv("TUSHARE_TOKEN", "").strip()
-    if tushare_token:
-        logger.info("[stock] trying Tushare Pro")
-        try:
-            import tushare as ts
-            ts.set_token(tushare_token)
-            pro = ts.pro_api()
-
-            # 仅当是 6 位代码时直接映射，否则走名称模糊匹配
-            ts_code = None
-            if re.fullmatch(r"\d{6}", symbol):
-                ts_code = f"{symbol}.SH" if symbol.startswith("6") else f"{symbol}.SZ"
-            else:
-                basic_df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,symbol,name")
-                match = basic_df[basic_df["name"].str.contains(symbol, na=False)]
-                if not match.empty:
-                    ts_code = match.iloc[0]["ts_code"]
-
-            if ts_code:
-                logger.info("[stock] tushare resolved ts_code=%s", ts_code)
-                code = str(ts_code).split(".")[0]
-                name_df = pro.stock_basic(ts_code=ts_code, fields="name")
-                name = name_df.iloc[0]["name"] if name_df is not None and not name_df.empty else code
-
-                # 先尝试分钟级
-                minute_err = None
-                try:
-                    quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=5)
-                    if quote_df is not None and not quote_df.empty:
-                        sort_col = None
-                        for c in ("trade_time", "datetime", "trade_date", "date"):
-                            if c in quote_df.columns:
-                                sort_col = c
-                                break
-                        if sort_col:
-                            quote_df = quote_df.sort_values(by=sort_col, ascending=True)
-                        row = quote_df.iloc[-1]
-                        data_time = (
-                            row.get("trade_time")
-                            or row.get("datetime")
-                            or row.get("trade_date")
-                            or row.get("date")
-                            or "N/A"
-                        )
-                        # 分钟K线的 high/low 仅代表该分钟，不等于当日最高/最低。
-                        # 若可获取当日快照，则优先返回当日口径，避免与券商/行情APP口径不一致。
-                        day_snapshot = None
-                        try:
-                            day_snapshot = _fetch_eastmoney_snapshot(code)
-                        except Exception:
-                            logger.exception("[stock] eastmoney calibration failed code=%s", code)
-
-                        if day_snapshot:
-                            return _format_result(
-                                name=day_snapshot.get("name", name),
-                                code=day_snapshot.get("code", code),
-                                latest=day_snapshot.get("latest", row.get("close", "N/A")),
-                                pct=day_snapshot.get("pct", "N/A"),
-                                open_p=day_snapshot.get("open_p", row.get("open", "N/A")),
-                                pre_close=day_snapshot.get("pre_close", row.get("pre_close", "N/A")),
-                                high=day_snapshot.get("high", "N/A"),
-                                low=day_snapshot.get("low", "N/A"),
-                                volume=day_snapshot.get("volume", row.get("vol", "N/A")),
-                                amount=day_snapshot.get("amount", row.get("amount", "N/A")),
-                                source="Tushare Pro + 东方财富快照校准",
-                                granularity="行情快照（当日）",
-                                data_time=str(data_time),
-                                fallback_note=fallback_note,
-                            )
-
-                        pre_close = row.get("pre_close", "N/A")
-                        close = row.get("close", "N/A")
-                        pct = "N/A"
-                        if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
-                            pct = round((close - pre_close) / pre_close * 100, 2)
-                        return _format_result(
-                            name=name,
-                            code=code,
-                            latest=close,
-                            pct=pct,
-                            open_p=row.get("open", "N/A"),
-                            pre_close=pre_close,
-                            high=row.get("high", "N/A"),
-                            low=row.get("low", "N/A"),
-                            volume=row.get("vol", "N/A"),
-                            amount=row.get("amount", "N/A"),
-                            source="Tushare Pro",
-                            granularity="1分钟K线（高低为该分钟）",
-                            data_time=str(data_time),
-                            fallback_note=(
-                                (fallback_note + "；" if fallback_note else "") +
-                                "当前为分钟K线口径，最高/最低为该分钟，不是当日最高/最低"
-                            ),
-                        )
-                    logger.warning("[stock] tushare 1min returned empty ts_code=%s", ts_code)
-                except Exception:
-                    minute_err = True
-                    logger.exception("[stock] tushare 1min failed, fallback to daily ts_code=%s", ts_code)
-                    fallback_note = "Tushare 分钟级接口不可用，已自动降级为日线（可能是接口次数受限）"
-
-                # 分钟级失败则降级到日线（仍然优先使用 Tushare）
-                try:
-                    daily_df = pro.daily(ts_code=ts_code, limit=1)
-                    if daily_df is not None and not daily_df.empty:
-                        row = daily_df.iloc[0]
-                        pre_close = row.get("pre_close", "N/A")
-                        close = row.get("close", "N/A")
-                        pct = "N/A"
-                        if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
-                            pct = round((close - pre_close) / pre_close * 100, 2)
-                        return _format_result(
-                            name=name,
-                            code=code,
-                            latest=close,
-                            pct=pct,
-                            open_p=row.get("open", "N/A"),
-                            pre_close=pre_close,
-                            high=row.get("high", "N/A"),
-                            low=row.get("low", "N/A"),
-                            volume=row.get("vol", "N/A"),
-                            amount=row.get("amount", "N/A"),
-                            source="Tushare Pro",
-                            granularity="日线收盘（降级）",
-                            data_time=str(row.get("trade_date", "N/A")),
-                            fallback_note=fallback_note,
-                        )
-                    logger.warning("[stock] tushare daily returned empty ts_code=%s", ts_code)
-                    if minute_err:
-                        fallback_note = "Tushare 分钟级失败且日线为空，已切换到备用数据源（可能是接口次数受限）"
-                except Exception:
-                    logger.exception("[stock] tushare daily fallback failed ts_code=%s", ts_code)
-                    if minute_err:
-                        fallback_note = "Tushare 分钟级/日线均失败，已切换到备用数据源（可能是接口次数受限）"
-            else:
-                logger.warning("[stock] tushare could not resolve symbol=%s", symbol)
-        except Exception:
-            logger.exception("[stock] tushare failed symbol=%s", symbol)
-    else:
-        logger.warning("[stock] TUSHARE_TOKEN missing, skip tushare")
-
-    # AKShare：保持为可选兜底，放到最后尝试（避免它在部分时段频繁失败抢占其它来源）
-
-    # 2) 兜底：东方财富直连 API（服务器上更稳）
+    # 统一优先级：东方财富 -> 腾讯 -> AKShare -> Tushare(最终兜底)
+    # 1) 首选：东方财富直连 API（服务器上更稳）
     try:
+        last_err = None
         logger.info("[stock] trying Eastmoney direct")
         if not re.fullmatch(r"\d{6}", symbol):
-            return (
-                f"无法用名称「{symbol}」走东方财富直连兜底。\n"
-                "请改用 6 位股票代码重试（如 600256）。"
-            )
+            logger.warning("[stock] Eastmoney direct skipped for non-code symbol=%s", symbol)
+        else:
+            for _ in range(3):
+                try:
+                    snapshot = _fetch_eastmoney_snapshot(symbol)
+                    if not snapshot:
+                        raise ValueError("东方财富返回空数据")
 
-        secid = f"{'1' if symbol.startswith('6') else '0'}.{symbol}"
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
-        params = {
-            "secid": secid,
-            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170",
-            "invt": "2",
-            "fltt": "2",
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/",
-        }
+                    return _format_result(
+                        name=snapshot.get("name", symbol),
+                        code=snapshot.get("code", symbol),
+                        latest=snapshot.get("latest", "N/A"),
+                        pct=snapshot.get("pct", "N/A"),
+                        open_p=snapshot.get("open_p", "N/A"),
+                        pre_close=snapshot.get("pre_close", "N/A"),
+                        high=snapshot.get("high", "N/A"),
+                        low=snapshot.get("low", "N/A"),
+                        volume=snapshot.get("volume", "N/A"),
+                        amount=snapshot.get("amount", "N/A"),
+                        source="东方财富直连",
+                        granularity="行情快照",
+                        data_time="N/A",
+                        fallback_note=fallback_note,
+                    )
+                except Exception as e:
+                    last_err = e
+                    logger.exception("[stock] Eastmoney direct attempt failed symbol=%s", symbol)
+                    time.sleep(0.6)
 
-        last_err = None
-        for _ in range(3):
+        # 2) 次级兜底：腾讯行情接口（无 key，字段较少）
+        if re.fullmatch(r"\d{6}", symbol):
             try:
-                snapshot = _fetch_eastmoney_snapshot(symbol)
-                if not snapshot:
-                    raise ValueError("东方财富返回空数据")
-
-                return _format_result(
-                    name=snapshot.get("name", symbol),
-                    code=snapshot.get("code", symbol),
-                    latest=snapshot.get("latest", "N/A"),
-                    pct=snapshot.get("pct", "N/A"),
-                    open_p=snapshot.get("open_p", "N/A"),
-                    pre_close=snapshot.get("pre_close", "N/A"),
-                    high=snapshot.get("high", "N/A"),
-                    low=snapshot.get("low", "N/A"),
-                    volume=snapshot.get("volume", "N/A"),
-                    amount=snapshot.get("amount", "N/A"),
-                    source="东方财富直连",
-                    granularity="行情快照",
-                    data_time="N/A",
-                    fallback_note=fallback_note,
+                logger.info("[stock] trying Tencent direct")
+                q_symbol = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
+                t_url = f"https://qt.gtimg.cn/q={q_symbol}"
+                t_resp = http_requests.get(
+                    t_url,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+                    timeout=10,
                 )
-            except Exception as e:
-                last_err = e
-                logger.exception("[stock] Eastmoney direct attempt failed symbol=%s", symbol)
-                time.sleep(0.6)
+                t_resp.raise_for_status()
+                text = t_resp.content.decode("gbk", errors="ignore")
+                parts = text.split("~")
+                # 关键字段：name=1, code=2, latest=3, pre_close=4, open=5, volume=6, amount=37
+                if len(parts) > 37 and parts[3]:
+                    latest = float(parts[3]) if parts[3] not in ("", "0") else "N/A"
+                    pre_close = float(parts[4]) if parts[4] not in ("", "0") else "N/A"
+                    open_p = float(parts[5]) if parts[5] not in ("", "0") else "N/A"
+                    pct = "N/A"
+                    if isinstance(latest, float) and isinstance(pre_close, float) and pre_close != 0:
+                        pct = round((latest - pre_close) / pre_close * 100, 2)
+                    return _format_result(
+                        name=parts[1] or symbol,
+                        code=parts[2] or symbol,
+                        latest=latest,
+                        pct=pct,
+                        open_p=open_p,
+                        pre_close=pre_close,
+                        high="N/A",
+                        low="N/A",
+                        volume=parts[6] if len(parts) > 6 else "N/A",
+                        amount=parts[37] if len(parts) > 37 else "N/A",
+                        source="腾讯行情直连",
+                        granularity="行情快照",
+                        data_time="N/A",
+                        fallback_note=fallback_note,
+                    )
+            except Exception:
+                logger.exception("[stock] Tencent direct failed symbol=%s", symbol)
 
-        # 3) 最后兜底：腾讯行情接口（无 key，字段较少）
-        try:
-            logger.info("[stock] trying Tencent direct")
-            q_symbol = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
-            t_url = f"https://qt.gtimg.cn/q={q_symbol}"
-            t_resp = http_requests.get(
-                t_url,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
-                timeout=10,
-            )
-            t_resp.raise_for_status()
-            text = t_resp.content.decode("gbk", errors="ignore")
-            parts = text.split("~")
-            # 关键字段：name=1, code=2, latest=3, pre_close=4, open=5, volume=6, amount=37
-            if len(parts) > 37 and parts[3]:
-                latest = float(parts[3]) if parts[3] not in ("", "0") else "N/A"
-                pre_close = float(parts[4]) if parts[4] not in ("", "0") else "N/A"
-                open_p = float(parts[5]) if parts[5] not in ("", "0") else "N/A"
-                pct = "N/A"
-                if isinstance(latest, float) and isinstance(pre_close, float) and pre_close != 0:
-                    pct = round((latest - pre_close) / pre_close * 100, 2)
-                return _format_result(
-                    name=parts[1] or symbol,
-                    code=parts[2] or symbol,
-                    latest=latest,
-                    pct=pct,
-                    open_p=open_p,
-                    pre_close=pre_close,
-                    high="N/A",
-                    low="N/A",
-                    volume=parts[6] if len(parts) > 6 else "N/A",
-                    amount=parts[37] if len(parts) > 37 else "N/A",
-                    source="腾讯行情直连",
-                    granularity="行情快照",
-                    data_time="N/A",
-                    fallback_note=fallback_note,
-                )
-        except Exception:
-            logger.exception("[stock] Tencent direct failed symbol=%s", symbol)
-
-        # 4) 最后兜底：AKShare（支持代码和名称查询，但对源站更敏感，故放最后）
+        # 3) 次级兜底：AKShare（支持代码和名称查询，但对源站更敏感）
         try:
             for _ in range(2):
                 try:
@@ -1153,8 +1157,142 @@ def tool_get_stock_price(symbol: str) -> str:
         except Exception:
             logger.exception("[stock] AKShare optional block unexpected failure symbol=%s", symbol)
 
+        # 4) 最终兜底：Tushare Pro（分钟级受限，放最后）
+        tushare_token = os.getenv("TUSHARE_TOKEN", "").strip()
+        if tushare_token:
+            logger.info("[stock] trying Tushare Pro as final fallback")
+            try:
+                import tushare as ts
+                ts.set_token(tushare_token)
+                pro = ts.pro_api()
+
+                ts_code = None
+                if re.fullmatch(r"\d{6}", symbol):
+                    ts_code = f"{symbol}.SH" if symbol.startswith("6") else f"{symbol}.SZ"
+                else:
+                    basic_df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,symbol,name")
+                    match = basic_df[basic_df["name"].str.contains(symbol, na=False)]
+                    if not match.empty:
+                        ts_code = match.iloc[0]["ts_code"]
+
+                if ts_code:
+                    logger.info("[stock] tushare resolved ts_code=%s", ts_code)
+                    code = str(ts_code).split(".")[0]
+                    name_df = pro.stock_basic(ts_code=ts_code, fields="name")
+                    name = name_df.iloc[0]["name"] if name_df is not None and not name_df.empty else code
+
+                    minute_err = None
+                    try:
+                        quote_df = ts.pro_bar(ts_code=ts_code, asset="E", freq="1min", limit=5)
+                        if quote_df is not None and not quote_df.empty:
+                            sort_col = None
+                            for c in ("trade_time", "datetime", "trade_date", "date"):
+                                if c in quote_df.columns:
+                                    sort_col = c
+                                    break
+                            if sort_col:
+                                quote_df = quote_df.sort_values(by=sort_col, ascending=True)
+                            row = quote_df.iloc[-1]
+                            data_time = (
+                                row.get("trade_time")
+                                or row.get("datetime")
+                                or row.get("trade_date")
+                                or row.get("date")
+                                or "N/A"
+                            )
+                            day_snapshot = None
+                            try:
+                                day_snapshot = _fetch_eastmoney_snapshot(code)
+                            except Exception:
+                                logger.exception("[stock] eastmoney calibration failed code=%s", code)
+
+                            if day_snapshot:
+                                return _format_result(
+                                    name=day_snapshot.get("name", name),
+                                    code=day_snapshot.get("code", code),
+                                    latest=day_snapshot.get("latest", row.get("close", "N/A")),
+                                    pct=day_snapshot.get("pct", "N/A"),
+                                    open_p=day_snapshot.get("open_p", row.get("open", "N/A")),
+                                    pre_close=day_snapshot.get("pre_close", row.get("pre_close", "N/A")),
+                                    high=day_snapshot.get("high", "N/A"),
+                                    low=day_snapshot.get("low", "N/A"),
+                                    volume=day_snapshot.get("volume", row.get("vol", "N/A")),
+                                    amount=day_snapshot.get("amount", row.get("amount", "N/A")),
+                                    source="Tushare Pro + 东方财富快照校准",
+                                    granularity="行情快照（当日）",
+                                    data_time=str(data_time),
+                                    fallback_note=fallback_note,
+                                )
+
+                            pre_close = row.get("pre_close", "N/A")
+                            close = row.get("close", "N/A")
+                            pct = "N/A"
+                            if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
+                                pct = round((close - pre_close) / pre_close * 100, 2)
+                            return _format_result(
+                                name=name,
+                                code=code,
+                                latest=close,
+                                pct=pct,
+                                open_p=row.get("open", "N/A"),
+                                pre_close=pre_close,
+                                high=row.get("high", "N/A"),
+                                low=row.get("low", "N/A"),
+                                volume=row.get("vol", "N/A"),
+                                amount=row.get("amount", "N/A"),
+                                source="Tushare Pro",
+                                granularity="1分钟K线（高低为该分钟）",
+                                data_time=str(data_time),
+                                fallback_note=(
+                                    (fallback_note + "；" if fallback_note else "") +
+                                    "当前为分钟K线口径，最高/最低为该分钟，不是当日最高/最低"
+                                ),
+                            )
+                        logger.warning("[stock] tushare 1min returned empty ts_code=%s", ts_code)
+                    except Exception:
+                        minute_err = True
+                        logger.exception("[stock] tushare 1min failed, fallback to daily ts_code=%s", ts_code)
+                        fallback_note = "Tushare 分钟级接口不可用，已自动降级为日线（可能是接口次数受限）"
+
+                    try:
+                        daily_df = pro.daily(ts_code=ts_code, limit=1)
+                        if daily_df is not None and not daily_df.empty:
+                            row = daily_df.iloc[0]
+                            pre_close = row.get("pre_close", "N/A")
+                            close = row.get("close", "N/A")
+                            pct = "N/A"
+                            if isinstance(close, (int, float)) and isinstance(pre_close, (int, float)) and pre_close:
+                                pct = round((close - pre_close) / pre_close * 100, 2)
+                            return _format_result(
+                                name=name,
+                                code=code,
+                                latest=close,
+                                pct=pct,
+                                open_p=row.get("open", "N/A"),
+                                pre_close=pre_close,
+                                high=row.get("high", "N/A"),
+                                low=row.get("low", "N/A"),
+                                volume=row.get("vol", "N/A"),
+                                amount=row.get("amount", "N/A"),
+                                source="Tushare Pro",
+                                granularity="日线收盘（降级）",
+                                data_time=str(row.get("trade_date", "N/A")),
+                                fallback_note=fallback_note,
+                            )
+                        logger.warning("[stock] tushare daily returned empty ts_code=%s", ts_code)
+                        if minute_err:
+                            fallback_note = "Tushare 分钟级失败且日线为空（可能是接口次数受限）"
+                    except Exception:
+                        logger.exception("[stock] tushare daily fallback failed ts_code=%s", ts_code)
+                else:
+                    logger.warning("[stock] tushare could not resolve symbol=%s", symbol)
+            except Exception:
+                logger.exception("[stock] tushare final fallback failed symbol=%s", symbol)
+        else:
+            logger.warning("[stock] TUSHARE_TOKEN missing, skip final tushare fallback")
+
         logger.error("[stock] all sources failed symbol=%s last_err=%s", symbol, last_err)
-        return f"股价查询失败: 东方财富直连重试后仍失败 ({last_err})"
+        return f"股价查询失败: 所有数据源均失败（最近错误: {last_err}）"
     except Exception as e:
         logger.exception("[stock] unexpected failure symbol=%s", symbol)
         return f"股价查询失败: {e}"
@@ -2160,6 +2298,14 @@ def chat():
     entry = str(data.get("entry", "")).strip()
     username = str(data.get("username", "")).strip()
     title = str(data.get("title", "")).strip()
+    user_id = None
+
+    if entry == WEB_FRONTEND_ENTRY:
+        current_user, err = _require_auth_user()
+        if err:
+            return err
+        username = current_user["username"]
+        user_id = current_user["id"]
     logger.info(f"[CHAT] prompt='{prompt[:80]}' provider={current_config['provider']} model={current_config['model']}")
 
     history = load_chat_history(chat_id)
@@ -2255,7 +2401,7 @@ def chat():
                 "建议切换到 qwen2.5:3b 后再试（如需 llama3.2:3b 请先手动 ollama pull）；复杂/联网任务也建议改用 Copilot。"
             )
             history.append({"role": "assistant", "content": warn_reply})
-            persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
+            persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
             return jsonify({"response": warn_reply})
 
     user_msg_idx = len(history)
@@ -2273,7 +2419,7 @@ def chat():
         history.append({"role": "user", "content": user_content})
         warn_reply = f"⚠️ 当前模型 [{current_config['model']}] 不支持图片识别，请切换到 gpt-4o 或 gpt-4o-mini 后再发图片。"
         history.append({"role": "assistant", "content": warn_reply})
-        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
+        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
         return jsonify({"response": warn_reply})
     else:
         history.append({"role": "user", "content": user_content})
@@ -2304,7 +2450,7 @@ def chat():
             reply = normalize_reply_for_entry(reply, entry)
             history[user_msg_idx] = {"role": "user", "content": restore_prompt}
             history.append({"role": "assistant", "content": reply})
-            persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
+            persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
             return jsonify({"response": reply})
 
         # Agent 循环：最多 10 轮工具调用
@@ -2359,13 +2505,13 @@ def chat():
                 reply = normalize_reply_for_entry(reply, entry)
                 history[user_msg_idx] = {"role": "user", "content": restore_prompt}
                 history.append({"role": "assistant", "content": reply})
-                persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
+                persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
                 return jsonify({"response": reply})
 
         # 超过最大轮次
         reply = "⚠️ Agent 执行轮次已达上限，任务可能未完全完成，请重新描述或继续追问。"
         history.append({"role": "assistant", "content": reply})
-        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, title=title)
+        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
         return jsonify({"response": reply})
 
     except Exception as e:
@@ -2376,6 +2522,28 @@ def chat():
 def clear_context():
     data = request.json
     chat_id = str(data.get("chat_id", "default"))
+    entry = str(data.get("entry", "")).strip()
+
+    if entry == WEB_FRONTEND_ENTRY:
+        current_user, err = _require_auth_user()
+        if err:
+            return err
+
+        if chat_id == "all":
+            conn = get_pg_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT chat_id FROM chat_sessions WHERE user_id = %s",
+                    (current_user["id"],),
+                )
+                rows = cur.fetchall()
+            for row in rows:
+                clear_chat_context(row[0], user_id=current_user["id"])
+            return jsonify({"status": "ok"})
+
+        clear_chat_context(chat_id, user_id=current_user["id"])
+        return jsonify({"status": "ok"})
+
     if chat_id == "all":
         clear_all_chat_contexts()
     else:
@@ -2686,6 +2854,224 @@ def fetch_stock_quote_json(symbol: str) -> dict:
     return {"error": f"未找到：{symbol}"}
 
 
+def fetch_stock_intraday_json(symbol: str) -> dict:
+    """获取股票/指数/ETF 当天分时走势（分钟级）。"""
+    symbol = (symbol or "").strip()
+    if not re.fullmatch(r"\d{6}", symbol):
+        return {"error": "symbol 必须是 6 位代码"}
+
+    today = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
+
+    def _estimated_intraday_from_quote() -> dict:
+        quote = fetch_stock_quote_json(symbol)
+        latest = quote.get("latest") if isinstance(quote, dict) else None
+        if latest is None:
+            return {"error": f"获取 {symbol} 当日分时失败"}
+        open_price = quote.get("open") if quote.get("open") is not None else latest
+        high_price = quote.get("high") if quote.get("high") is not None else max(latest, open_price)
+        low_price = quote.get("low") if quote.get("low") is not None else min(latest, open_price)
+
+        # 网络受限时给出可视化兜底，避免前端直接报错。
+        points = [
+            {"time": "09:30", "price": float(open_price)},
+            {"time": "10:30", "price": float((open_price + high_price) / 2)},
+            {"time": "11:30", "price": float(high_price)},
+            {"time": "14:00", "price": float((high_price + low_price) / 2)},
+            {"time": "15:00", "price": float(latest)},
+        ]
+        return {
+            "symbol": symbol,
+            "name": quote.get("name") or symbol,
+            "source": "估算分时(网络受限)",
+            "date": today,
+            "points": points,
+        }
+
+    is_index = symbol in _A_MAJOR_INDEX_CODES or symbol.startswith("399")
+    if is_index:
+        market = "0" if symbol.startswith("399") else "1"
+    else:
+        market = "1" if symbol[0] in ("5", "6") else "0"
+
+    secid = f"{market}.{symbol}"
+    try:
+        url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+        params = {
+            "secid": secid,
+            "ndays": "1",
+            "iscr": "0",
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "_": str(int(time.time() * 1000)),
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        resp = http_requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        data = payload.get("data") or {}
+        trends = data.get("trends") or []
+        if not trends:
+            return {"error": f"未找到 {symbol} 的当日分时数据"}
+
+        points = []
+        for row in trends:
+            # 典型格式：2026-06-03 09:30,10.12,10.15,10.18,10.10,12345,67890123,10.16
+            parts = str(row).split(",")
+            if len(parts) < 2:
+                continue
+            dt_text = parts[0].strip()
+            price_text = parts[1].strip()
+            if not dt_text or not price_text:
+                continue
+            try:
+                price = float(price_text)
+            except Exception:
+                continue
+            time_label = dt_text[-5:] if len(dt_text) >= 5 else dt_text
+            points.append({"time": time_label, "price": price})
+
+        if not points:
+            raise ValueError("eastmoney empty intraday points")
+
+        return {
+            "symbol": symbol,
+            "name": data.get("name") or symbol,
+            "source": "东方财富分时",
+            "date": today,
+            "points": points,
+        }
+    except Exception:
+        logger.exception("[market/intraday] eastmoney failed symbol=%s", symbol)
+
+    # 兜底：AKShare 分时接口（部分网络环境下比直连更稳）
+    try:
+        import akshare as ak
+        df = None
+        if hasattr(ak, "stock_intraday_em"):
+            df = ak.stock_intraday_em(symbol=symbol)
+        elif hasattr(ak, "stock_zh_a_hist_min_em"):
+            df = ak.stock_zh_a_hist_min_em(symbol=symbol, period="1", adjust="")
+
+        if df is None or df.empty:
+            raise ValueError("akshare empty intraday dataframe")
+
+        cols = [str(c) for c in df.columns]
+        time_col = next((c for c in cols if c in ("时间", "日期", "datetime", "time")), cols[0])
+        price_col = next((c for c in cols if c in ("最新价", "收盘", "close", "最新", "价格")), None)
+        if price_col is None:
+            # 尝试数值列作为价格列
+            for c in cols:
+                series = df[c]
+                try:
+                    _ = float(series.iloc[-1])
+                    price_col = c
+                    break
+                except Exception:
+                    continue
+
+        if price_col is None:
+            raise ValueError("akshare missing price column")
+
+        today = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
+        points = []
+        for _, row in df.iterrows():
+            raw_t = str(row.get(time_col, "")).strip()
+            raw_p = row.get(price_col)
+            if not raw_t:
+                continue
+            # 保留当日数据（若字段不含日期则直接保留）
+            if len(raw_t) >= 10 and raw_t[4] == "-" and raw_t[:10] != today:
+                continue
+            try:
+                price = float(raw_p)
+            except Exception:
+                continue
+            t_label = raw_t[-5:] if len(raw_t) >= 5 else raw_t
+            points.append({"time": t_label, "price": price})
+
+        if not points:
+            raise ValueError("akshare empty filtered points")
+
+        return {
+            "symbol": symbol,
+            "name": symbol,
+            "source": "AKShare 分时",
+            "date": today,
+            "points": points,
+        }
+    except Exception:
+        logger.exception("[market/intraday] akshare fallback failed symbol=%s", symbol)
+
+    # 兜底：腾讯 minute API（部分网络场景更稳）
+    try:
+        q_prefix = "sh" if symbol[0] in ("5", "6") and not symbol.startswith("399") else "sz"
+        q_code = f"{q_prefix}{symbol}"
+        t_url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={q_code}"
+        resp = http_requests.get(t_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        data = (payload.get("data") or {}).get(q_code) or {}
+        minute = data.get("data") or {}
+        raw_points = minute.get("data") or []
+        if not raw_points:
+            raise ValueError("tencent empty points")
+
+        points = []
+        for item in raw_points:
+            if not item:
+                continue
+
+            raw_time = ""
+            raw_price = ""
+
+            # 腾讯返回在不同环境下可能是字符串、数组或对象。
+            if isinstance(item, str):
+                text = item.strip().replace(",", " ")
+                fields = [p for p in text.split() if p]
+                if len(fields) >= 2:
+                    raw_time = fields[0]
+                    raw_price = fields[1]
+            elif isinstance(item, (list, tuple)):
+                raw_time = str(item[0]).strip() if len(item) > 0 else ""
+                raw_price = str(item[1]).strip() if len(item) > 1 else ""
+            elif isinstance(item, dict):
+                raw_time = str(item.get("time") or item.get("t") or "").strip()
+                raw_price = str(item.get("price") or item.get("p") or "").strip()
+
+            if not raw_time or not raw_price:
+                continue
+
+            if re.fullmatch(r"\d{4}", raw_time):
+                t_label = f"{raw_time[:2]}:{raw_time[2:]}"
+            else:
+                t_label = raw_time[-5:] if len(raw_time) >= 5 else raw_time
+
+            try:
+                price = float(raw_price)
+            except Exception:
+                continue
+            points.append({"time": t_label, "price": price})
+
+        if not points:
+            raise ValueError("tencent parsed points empty")
+
+        return {
+            "symbol": symbol,
+            "name": data.get("qt", {}).get(q_code, [symbol])[1] if isinstance(data.get("qt"), dict) else symbol,
+            "source": "腾讯分时",
+            "date": minute.get("date") or today,
+            "points": points,
+        }
+    except Exception:
+        logger.exception("[market/intraday] tencent fallback failed symbol=%s", symbol)
+
+    return _estimated_intraday_from_quote()
+
+
 def fetch_gold_quote_json(symbol: str = "Au99.99") -> dict:
     """获取黄金行情，返回结构化字典（供前端 REST API 消费）。"""
     import akshare as ak
@@ -2770,25 +3156,114 @@ def fetch_gold_quote_json(symbol: str = "Au99.99") -> dict:
     return {"error": "黄金价格查询失败"}
 
 
-# ──────────────────── 用户认证 ────────────────────
-# 固定用户表（不做持久化，硬编码两个账号即可）
-_USERS = {
-    "admin":   {"password": "123456",  "role": "guest",  "display_name": "游客"},
-    "manager": {"password": "1111011", "role": "admin",  "display_name": "管理员"},
-}
-
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
-    user = _USERS.get(username)
-    if not user or user["password"] != password:
+    if not username or not password:
+        return jsonify({"message": "用户名和密码不能为空"}), 400
+
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, password_hash, role, display_name
+            FROM users
+            WHERE username = %s
+            """,
+            (username,),
+        )
+        row = cur.fetchone()
+
+    if not row:
         return jsonify({"message": "用户名或密码错误"}), 401
+
+    user_id, password_hash, role, display_name = row
+    if not hmac.compare_digest(password_hash, _hash_password(password)):
+        return jsonify({"message": "用户名或密码错误"}), 401
+
+    token = _issue_auth_token(user_id)
     return jsonify({
-        "role": user["role"],
+        "token": token,
+        "user_id": user_id,
+        "role": role,
         "username": username,
-        "display_name": user["display_name"],
+        "display_name": display_name,
+    })
+
+
+@app.route("/api/users", methods=["GET"])
+def list_users():
+    current_user, err = _require_auth_user(admin_only=True)
+    if err:
+        return err
+
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, username, role, display_name, created_at
+            FROM users
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+    return jsonify({
+        "users": [
+            {
+                "id": r[0],
+                "username": r[1],
+                "role": r[2],
+                "display_name": r[3],
+                "created_at": r[4].isoformat() if r[4] else "",
+            }
+            for r in rows
+        ]
+    })
+
+
+@app.route("/api/users", methods=["POST"])
+def create_user():
+    current_user, err = _require_auth_user(admin_only=True)
+    if err:
+        return err
+
+    data = request.get_json(force=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    role = str(data.get("role") or "guest").strip()
+    display_name = str(data.get("display_name") or username).strip()
+
+    if not username or not password:
+        return jsonify({"error": "username 和 password 不能为空"}), 400
+    if role not in {"guest", "admin"}:
+        return jsonify({"error": "role 必须是 guest 或 admin"}), 400
+
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users(username, password_hash, role, display_name)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (username, _hash_password(password), role, display_name),
+            )
+            row = cur.fetchone()
+    except Exception:
+        return jsonify({"error": "用户名已存在或创建失败"}), 400
+
+    return jsonify({
+        "status": "ok",
+        "created_by": current_user["username"],
+        "user": {
+            "id": row[0] if row else None,
+            "username": username,
+            "role": role,
+            "display_name": display_name,
+        },
     })
 
 
@@ -2796,21 +3271,22 @@ def login():
 
 @app.route("/api/sessions", methods=["GET"])
 def list_sessions():
-    """列出指定用户的历史会话（按最后更新时间倒序，最多 50 条）。"""
-    username = request.args.get("username", "").strip()
-    if not username:
-        return jsonify({"error": "username 不能为空"}), 400
+    """列出当前登录用户的历史会话（按最后更新时间倒序，最多 50 条）。"""
+    current_user, err = _require_auth_user()
+    if err:
+        return err
+
     conn = get_pg_conn()
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT chat_id, title, updated_at
             FROM chat_sessions
-            WHERE username = %s
+            WHERE user_id = %s
             ORDER BY updated_at DESC
             LIMIT 50
             """,
-            (username,),
+            (current_user["id"],),
         )
         rows = cur.fetchall()
     sessions = [
@@ -2827,10 +3303,21 @@ def list_sessions():
 @app.route("/api/sessions/<chat_id>/messages", methods=["GET"])
 def get_session_messages(chat_id):
     """获取指定会话的消息列表（仅 user/assistant 角色，供前端回显）。"""
+    current_user, err = _require_auth_user()
+    if err:
+        return err
+
     if not chat_id:
         return jsonify({"error": "chat_id 不能为空"}), 400
     conn = get_pg_conn()
     with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM chat_sessions WHERE chat_id = %s AND user_id = %s",
+            (chat_id, current_user["id"]),
+        )
+        if not cur.fetchone():
+            return jsonify({"error": "会话不存在或无权限"}), 404
+
         cur.execute(
             """
             SELECT role, content, created_at
@@ -2879,24 +3366,37 @@ def market_quote():
     return jsonify(result)
 
 
+@app.route("/api/market/intraday", methods=["GET"])
+def market_intraday():
+    """获取当日分时走势图数据（目前仅股票/指数/ETF）。"""
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol 不能为空"}), 400
+    result = fetch_stock_intraday_json(symbol)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
 # ──────────────────── 自选行情 API ────────────────────
 
 @app.route("/api/watchlist", methods=["GET"])
 def get_watchlist():
     """获取用户自选列表，按 position 升序。"""
-    username = request.args.get("username", "").strip()
-    if not username:
-        return jsonify({"error": "username 不能为空"}), 400
+    current_user, err = _require_auth_user()
+    if err:
+        return err
+
     conn = get_pg_conn()
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT symbol, kind, label, position
             FROM user_watchlist
-            WHERE username = %s
+            WHERE user_id = %s
             ORDER BY position ASC
             """,
-            (username,),
+            (current_user["id"],),
         )
         rows = cur.fetchall()
     items = [{"symbol": r[0], "kind": r[1], "label": r[2], "position": r[3]} for r in rows]
@@ -2905,17 +3405,18 @@ def get_watchlist():
 
 @app.route("/api/watchlist", methods=["PUT"])
 def save_watchlist():
-    """全量覆盖保存用户自选列表（传入 username + items 数组）。"""
+    """全量覆盖保存当前用户自选列表。"""
+    current_user, err = _require_auth_user()
+    if err:
+        return err
+
     data = request.get_json(force=True) or {}
-    username = (data.get("username") or "").strip()
     items = data.get("items", [])
-    if not username:
-        return jsonify({"error": "username 不能为空"}), 400
     if not isinstance(items, list):
         return jsonify({"error": "items 必须是数组"}), 400
     conn = get_pg_conn()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM user_watchlist WHERE username = %s", (username,))
+        cur.execute("DELETE FROM user_watchlist WHERE user_id = %s", (current_user["id"],))
         for idx, item in enumerate(items):
             sym = (item.get("symbol") or "").strip()
             kind = (item.get("kind") or "stock").strip()
@@ -2924,12 +3425,12 @@ def save_watchlist():
                 continue
             cur.execute(
                 """
-                INSERT INTO user_watchlist(username, symbol, kind, label, position)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO user_watchlist(username, user_id, symbol, kind, label, position)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (username, symbol) DO UPDATE
                 SET kind=EXCLUDED.kind, label=EXCLUDED.label, position=EXCLUDED.position
                 """,
-                (username, sym, kind, label, idx),
+                (current_user["username"], current_user["id"], sym, kind, label, idx),
             )
     conn.commit()
     return jsonify({"status": "ok", "saved": len(items)})
