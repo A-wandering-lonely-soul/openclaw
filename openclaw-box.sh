@@ -74,9 +74,93 @@ show_menu() {
     echo "（11）管理图片存储"
     echo "（12）重置配置（重新输入 Token 和域名）"
     echo "（13）卸载（停止并移除 Docker 容器）"
+    echo " （14）微信 ClawBot（Beta）管理"
     echo " （0）退出"
     echo "=============================="
     echo -n "请选择: "
+}
+
+manage_wechat_clawbot() {
+    if ! command -v openclaw >/dev/null 2>&1; then
+        echo ""
+        echo "❌ 未检测到 openclaw CLI。"
+        echo "   请先安装官方 CLI，再使用微信 ClawBot（Beta）管理入口。"
+        echo "   安装方式示例：npm install -g openclaw"
+        return
+    fi
+
+    while true; do
+        echo ""
+        echo "--- 微信 ClawBot（Beta）管理 ---"
+        echo " （1）查看通道状态"
+        echo " （2）重新扫码登录"
+        echo " （3）查看插件列表"
+        echo " （4）查看网关状态"
+        echo " （5）安全重启网关"
+        echo " （6）查看更新状态"
+        echo " （7）更新到 beta 渠道"
+        echo " （8）移除微信通道"
+        echo " （9）修复配置 / 插件问题"
+        echo " （10）查看后端微信桥接状态"
+        echo " （0）返回"
+        echo -n "请选择: "
+        read -r beta_choice
+
+        case "$beta_choice" in
+            1)
+                openclaw channels status --channel openclaw-weixin
+                ;;
+            2)
+                openclaw channels login --channel openclaw-weixin
+                ;;
+            3)
+                openclaw plugins list
+                ;;
+            4)
+                openclaw gateway status
+                ;;
+            5)
+                openclaw gateway restart --safe
+                ;;
+            6)
+                openclaw update status
+                ;;
+            7)
+                echo "⚠️  将更新 OpenClaw 到 beta 渠道，通常会同步插件并重启网关。"
+                read -rp "确认继续？(y/N): " confirm_update
+                case "$confirm_update" in
+                    y|Y) openclaw update --channel beta ;;
+                    *) echo "已取消" ;;
+                esac
+                ;;
+            8)
+                echo "⚠️  将移除微信通道配置与会话绑定。"
+                read -rp "确认移除 openclaw-weixin？(y/N): " confirm_remove
+                case "$confirm_remove" in
+                    y|Y)
+                        openclaw channels remove --channel openclaw-weixin --delete
+                        echo "如仍存在对应插件记录，可再执行 openclaw plugins uninstall <插件ID>。"
+                        ;;
+                    *) echo "已取消" ;;
+                esac
+                ;;
+            9)
+                openclaw doctor --fix
+                ;;
+            10)
+                echo ""
+                echo "--- 后端微信桥接状态 (/api/channel/wechat/status) ---"
+                curl -s "$API_URL/api/channel/wechat/status" || echo "❌ 无法访问后端桥接状态接口"
+                echo ""
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "❌ 无效选项"
+                ;;
+        esac
+    done
 }
 
 switch_model() {
@@ -456,6 +540,7 @@ while true; do
         11) manage_images ;;
         12) reset_config ;;
         13) uninstall_services ;;
+        14) manage_wechat_clawbot ;;
         0) echo "退出。"; exit 0 ;;
         *) echo "❌ 无效选项，请重新输入" ;;
     esac

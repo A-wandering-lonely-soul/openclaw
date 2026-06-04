@@ -61,6 +61,11 @@ REDIS_CHAT_TTL_SECONDS = int(os.getenv("REDIS_CHAT_TTL_SECONDS", "604800"))
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://openclaw:openclaw@postgres:5432/openclaw")
 AUTH_PASSWORD_PEPPER = os.getenv("AUTH_PASSWORD_PEPPER", "openclaw-dev-pepper")
 AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "30"))
+WECHAT_BRIDGE_ENABLED = os.getenv("WECHAT_BRIDGE_ENABLED", "0") == "1"
+WECHAT_BRIDGE_TOKEN = os.getenv("WECHAT_BRIDGE_TOKEN", "").strip()
+WECHAT_BRIDGE_PROVIDER = os.getenv("WECHAT_BRIDGE_PROVIDER", "").strip()
+WECHAT_BRIDGE_MODEL = os.getenv("WECHAT_BRIDGE_MODEL", "").strip()
+WECHAT_BRIDGE_DEDUP_TTL_SECONDS = int(os.getenv("WECHAT_BRIDGE_DEDUP_TTL_SECONDS", "600"))
 
 redis_client = None
 pg_conn = None
@@ -627,6 +632,7 @@ BUILTIN_TOOL_NAMES = {
 }
 
 WEB_FRONTEND_ENTRY = "web_frontend"
+WECHAT_BRIDGE_ENTRY = "wechat_clawbot"
 WEB_FRONTEND_ALLOWED_TOOL_NAMES = {
     "schedule_task",
     "schedule_reminder",
@@ -2248,14 +2254,28 @@ def should_downgrade_ollama_search(prompt: str, history: list, images: list) -> 
     return False
 
 
-def get_client():
-    provider = PROVIDERS[current_config["provider"]]
+def get_runtime_config_for_entry(entry: str) -> dict:
+    runtime = {
+        "provider": current_config["provider"],
+        "model": current_config["model"],
+    }
+    if entry == WECHAT_BRIDGE_ENTRY:
+        if WECHAT_BRIDGE_PROVIDER in PROVIDERS:
+            runtime["provider"] = WECHAT_BRIDGE_PROVIDER
+        if WECHAT_BRIDGE_MODEL:
+            runtime["model"] = WECHAT_BRIDGE_MODEL
+    return runtime
+
+
+def get_client(config: dict | None = None):
+    runtime = config or current_config
+    provider = PROVIDERS[runtime["provider"]]
     api_key = os.getenv(provider.get("api_key_env", ""), "")
     if not api_key:
         api_key = provider.get("default_api_key", "")
     if not api_key:
         api_key = "dummy"
-    if current_config["provider"] == "ollama":
+    if runtime["provider"] == "ollama":
         return OpenAI(
             api_key=api_key,
             base_url=provider["base_url"],
@@ -2288,6 +2308,39 @@ def fetch_ollama_models() -> set[str]:
     return models
 
 
+def _extract_wechat_bridge_token() -> str:
+    token = (request.headers.get("X-Wechat-Bridge-Token") or "").strip()
+    if token:
+        return token
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+
+def _wechat_bridge_auth_ok() -> bool:
+    if not WECHAT_BRIDGE_TOKEN:
+        return False
+    provided = _extract_wechat_bridge_token()
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, WECHAT_BRIDGE_TOKEN)
+
+
+def _mark_wechat_event_once(event_id: str) -> bool:
+    if not event_id:
+        return True
+    key = f"openclaw:wechat:event:{event_id}"
+    try:
+        created = bool(redis_client.setnx(key, "1"))
+        if created:
+            redis_client.expire(key, WECHAT_BRIDGE_DEDUP_TTL_SECONDS)
+        return created
+    except Exception:
+        # Redis 临时异常时，不阻断主流程。
+        return True
+
+
 # ─── API 路由 ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/chat", methods=["POST"])
@@ -2299,6 +2352,9 @@ def chat():
     username = str(data.get("username", "")).strip()
     title = str(data.get("title", "")).strip()
     user_id = None
+    runtime_config = get_runtime_config_for_entry(entry)
+    runtime_provider = runtime_config["provider"]
+    runtime_model = runtime_config["model"]
 
     if entry == WEB_FRONTEND_ENTRY:
         current_user, err = _require_auth_user()
@@ -2306,12 +2362,12 @@ def chat():
             return err
         username = current_user["username"]
         user_id = current_user["id"]
-    logger.info(f"[CHAT] prompt='{prompt[:80]}' provider={current_config['provider']} model={current_config['model']}")
+    logger.info(f"[CHAT] prompt='{prompt[:80]}' provider={runtime_provider} model={runtime_model} entry={entry or 'default'}")
 
     history = load_chat_history(chat_id)
     history_start_idx = len(history)
 
-    ollama_mode = current_config["provider"] == "ollama"
+    ollama_mode = runtime_provider == "ollama"
     images = data.get("images", [])
 
     # 联网搜索增强
@@ -2391,13 +2447,13 @@ def chat():
                 )
 
     # 处理图片（vision）
-    vision_supported = current_config["model"] not in VISION_UNSUPPORTED_MODELS
+    vision_supported = runtime_model not in VISION_UNSUPPORTED_MODELS
 
-    if ollama_mode and current_config["model"] in OLLAMA_HEAVY_MODELS:
+    if ollama_mode and runtime_model in OLLAMA_HEAVY_MODELS:
         high_risk_request = len(prompt) > 200 or bool(images)
         if high_risk_request:
             warn_reply = (
-                f"⚠️ 当前 Ollama 模型 [{current_config['model']}] 属于重型模型，在低配 CPU 服务器上很容易超时或占满资源。"
+                f"⚠️ 当前 Ollama 模型 [{runtime_model}] 属于重型模型，在低配 CPU 服务器上很容易超时或占满资源。"
                 "建议切换到 qwen2.5:3b 后再试（如需 llama3.2:3b 请先手动 ollama pull）；复杂/联网任务也建议改用 Copilot。"
             )
             history.append({"role": "assistant", "content": warn_reply})
@@ -2417,7 +2473,7 @@ def chat():
         history.append({"role": "user", "content": content_blocks})
     elif images and not vision_supported:
         history.append({"role": "user", "content": user_content})
-        warn_reply = f"⚠️ 当前模型 [{current_config['model']}] 不支持图片识别，请切换到 gpt-4o 或 gpt-4o-mini 后再发图片。"
+        warn_reply = f"⚠️ 当前模型 [{runtime_model}] 不支持图片识别，请切换到 gpt-4o 或 gpt-4o-mini 后再发图片。"
         history.append({"role": "assistant", "content": warn_reply})
         persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
         return jsonify({"response": warn_reply})
@@ -2426,12 +2482,12 @@ def chat():
 
     restore_prompt = f"[图片] {prompt}" if images else prompt
     use_tools = (
-        current_config["provider"] not in TOOL_UNSUPPORTED_PROVIDERS
-        and current_config["model"] not in TOOL_UNSUPPORTED_MODELS
+        runtime_provider not in TOOL_UNSUPPORTED_PROVIDERS
+        and runtime_model not in TOOL_UNSUPPORTED_MODELS
     )
 
     try:
-        client = get_client()
+        client = get_client(runtime_config)
         system_prompt = build_system_prompt(chat_id, entry)
         messages = [{"role": "system", "content": system_prompt}] + history
         available_tools = tools_for_entry(entry)
@@ -2439,7 +2495,7 @@ def chat():
         if not use_tools:
             # 不支持工具的模型，退回纯对话
             request_args = {
-                "model": current_config["model"],
+                "model": runtime_model,
                 "messages": messages,
             }
             if ollama_mode:
@@ -2457,7 +2513,7 @@ def chat():
         for _ in range(10):
             messages = [{"role": "system", "content": system_prompt}] + history
             request_args = {
-                "model": current_config["model"],
+                "model": runtime_model,
                 "messages": messages,
                 "tools": available_tools,
                 "tool_choice": "auto",
@@ -2516,6 +2572,61 @@ def chat():
 
     except Exception as e:
         return jsonify({"response": f"AI 服务出错: {e}"}), 500
+
+
+@app.route("/api/channel/wechat/status", methods=["GET"])
+def wechat_bridge_status():
+    runtime = get_runtime_config_for_entry(WECHAT_BRIDGE_ENTRY)
+    return jsonify({
+        "enabled": WECHAT_BRIDGE_ENABLED,
+        "token_configured": bool(WECHAT_BRIDGE_TOKEN),
+        "entry": WECHAT_BRIDGE_ENTRY,
+        "provider": runtime["provider"],
+        "model": runtime["model"],
+        "dedup_ttl_seconds": WECHAT_BRIDGE_DEDUP_TTL_SECONDS,
+    })
+
+
+@app.route("/api/channel/wechat/chat", methods=["POST"])
+def wechat_bridge_chat():
+    if not WECHAT_BRIDGE_ENABLED:
+        return jsonify({"error": "wechat bridge disabled"}), 503
+    if not WECHAT_BRIDGE_TOKEN:
+        return jsonify({"error": "wechat bridge token not configured"}), 503
+    if not _wechat_bridge_auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True) or {}
+    prompt = str(data.get("prompt") or data.get("message") or "").strip()
+    images = data.get("images") or []
+    source_chat_id = str(data.get("chat_id") or "").strip()
+    source_user_id = str(data.get("user_id") or data.get("from_user_id") or "").strip()
+    event_id = str(data.get("event_id") or data.get("message_id") or "").strip()
+    title = str(data.get("title") or "").strip()
+
+    if not prompt and not images:
+        return jsonify({"error": "prompt or images is required"}), 400
+
+    base_id = source_chat_id or source_user_id
+    if not base_id:
+        return jsonify({"error": "chat_id or user_id is required"}), 400
+
+    chat_id = base_id if base_id.startswith("wechat_") else f"wechat_{base_id}"
+
+    if event_id and not _mark_wechat_event_once(event_id):
+        return jsonify({"status": "duplicate", "chat_id": chat_id, "response": ""})
+
+    inner_payload = {
+        "prompt": prompt or "(用户发送了图片)",
+        "chat_id": chat_id,
+        "entry": WECHAT_BRIDGE_ENTRY,
+        "images": images,
+        "title": title,
+    }
+
+    # 在同一进程内复用现有 /api/chat 逻辑，避免维护两套消息处理链路。
+    with app.test_request_context("/api/chat", method="POST", json=inner_payload):
+        return chat()
 
 
 @app.route("/api/clear_context", methods=["POST"])

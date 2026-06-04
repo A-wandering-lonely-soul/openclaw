@@ -1,6 +1,6 @@
 # OpenClaw
 
-基于 GitHub Copilot API 的 AI 聊天机器人，支持 Telegram 和飞书，通过 Docker 部署。
+基于 GitHub Copilot API 的 AI 聊天机器人，支持 Telegram、飞书，以及微信官方 ClawBot（Beta）接入，通过 Docker 部署 + OpenClaw CLI 管理。
 也可用仓库项目openclaw-web的前端作为界面（多加个nginx代理即可），接入了实时查股票和黄金价格的接口，很适合监控股市，并且这个前端项目对数据处理做了优化，可以将数据生成为图表结构，体验比原来md文档格式更好。
 
 **主要功能：**
@@ -10,7 +10,7 @@
 - 网页端自选股列表**按用户持久化至 PostgreSQL**，多设备/多浏览器保持一致
 - Skill 插件机制（第一版）：支持从本地目录加载 skill.json，动态扩展工具与系统提示
 - 聊天上下文采用 Redis（热缓存）+ PostgreSQL（持久化）
-- 支持 Telegram Bot 和飞书机器人双渠道接入
+- 支持 Telegram Bot、飞书机器人，以及微信官方 ClawBot（Beta）双层接入
 - 服务器管理面板 `openclaw-box`
 
 ---
@@ -40,6 +40,21 @@ openclaw/
 ├── .env.example          # 环境变量模板
 └── .env                  # 密钥配置（不提交到 git）
 ```
+
+---
+
+## 给 AI 助手的快速入口（推荐先读）
+
+如果你在别的会话窗口让 AI 协助改代码，建议先让它读这一节：
+
+- 核心对话入口是 `/api/chat`，主逻辑在 `openclaw/run_server.py`。
+- 渠道按 `entry` 区分：`telegram`、`feishu`、`web_frontend`、`wechat_clawbot`。
+- 模型策略默认是全局配置（`OPENAI_PROVIDER` / `OPENAI_MODEL`），微信桥接可单独覆盖：`WECHAT_BRIDGE_PROVIDER` / `WECHAT_BRIDGE_MODEL`。
+- 微信桥接 API：
+   - `GET /api/channel/wechat/status`：看桥接是否启用、token 是否配置、当前微信渠道模型。
+   - `POST /api/channel/wechat/chat`：微信入口转发到后端，最终复用 `/api/chat` 主链路。
+- 微信桥接鉴权：请求头 `X-Wechat-Bridge-Token`（或 `Authorization: Bearer <token>`）必须等于 `WECHAT_BRIDGE_TOKEN`。
+- 微信去重：使用 `event_id` / `message_id`，TTL 由 `WECHAT_BRIDGE_DEDUP_TTL_SECONDS` 控制。
 
 ---
 
@@ -86,6 +101,41 @@ openclaw/
 1. 打开 [tushare.pro](https://tushare.pro) 注册账号
 2. 在个人中心获取 Token
 3. 填入 `.env` 的 `TUSHARE_TOKEN=...`
+
+**微信官方 ClawBot（Beta，可选，用于个人微信接入）**
+1. 先安装官方 OpenClaw CLI：`npm install -g openclaw`
+2. 初始化或修复本机配置：`openclaw configure`（也可以先用 `openclaw doctor --fix` 看是否有配置损坏）
+3. 在配置向导里选择本机 Gateway、模型提供商、以及 `openclaw-weixin` 通道
+4. 执行微信扫码登录：`openclaw channels login --channel openclaw-weixin`
+5. 登录后用 `openclaw channels status --channel openclaw-weixin` 确认通道处于 `enabled / configured / running`
+6. 如果通道或插件更新过，重启网关：`openclaw gateway restart --safe`
+7. 如果你要让微信消息也走本仓库的行情、搜索和上下文优化，请启用后端桥接配置（见下方环境变量）
+
+**微信桥接到本仓库后端（渠道独立模型）**
+
+在 `.env`（或容器环境变量）中补充：
+
+```dotenv
+WECHAT_BRIDGE_ENABLED=1
+WECHAT_BRIDGE_TOKEN=请填随机长token
+WECHAT_BRIDGE_PROVIDER=deepseek
+WECHAT_BRIDGE_MODEL=deepseek-chat
+WECHAT_BRIDGE_DEDUP_TTL_SECONDS=600
+```
+
+说明：
+- `WECHAT_BRIDGE_ENABLED=1` 才会开放 `/api/channel/wechat/chat`。
+- 微信桥接模型独立于 Web/Telegram/飞书；不填 `WECHAT_BRIDGE_PROVIDER/MODEL` 时，回退到全局模型。
+- 微信侧转发程序应调用 `POST /api/channel/wechat/chat`，并带 `X-Wechat-Bridge-Token`。
+- 后端会自动把微信会话映射为 `chat_id=wechat_<id>`，并将 `entry` 固定为 `wechat_clawbot`。
+
+**微信 ClawBot 的更新 / 回退 / 卸载**
+1. 查看更新状态：`openclaw update status`
+2. 更新到 Beta 渠道：`openclaw update --channel beta`
+3. 更新后建议再执行：`openclaw gateway restart --safe`
+4. 移除微信通道：`openclaw channels remove --channel openclaw-weixin --delete`
+5. 如果仍有插件记录残留，先用 `openclaw plugins list` 找到插件 ID，再执行：`openclaw plugins uninstall <插件ID>`
+6. 配置乱了或升级后出问题时，优先执行：`openclaw doctor --fix`
 
 ---
 
@@ -236,6 +286,27 @@ docker ps
 ```
 
 已启用的相关容器均为 `Up` 状态即部署成功。未选择的 Telegram 或飞书容器不会出现。
+
+### 7.1 微信 ClawBot（Beta）管理入口
+
+微信官方通道不是 Docker 容器，它通过 OpenClaw CLI 的 `channels`、`plugins`、`gateway`、`update` 和 `doctor` 管理。
+
+你可以把下面这些命令当成固定运维入口：
+
+```bash
+openclaw channels status --channel openclaw-weixin
+openclaw channels login --channel openclaw-weixin
+openclaw gateway status
+openclaw gateway restart --safe
+openclaw update status
+openclaw update --channel beta
+openclaw channels remove --channel openclaw-weixin --delete
+openclaw plugins uninstall <插件ID>
+openclaw doctor --fix
+curl -s http://127.0.0.1:8000/api/channel/wechat/status
+```
+
+这些命令也已经放进 [openclaw-box.sh](openclaw-box.sh) 的新菜单项里，方便你后续一键检查、更新、卸载和修复。
 
 ### 8. 查看上下文存储（PostgreSQL / Redis）
 
@@ -503,14 +574,18 @@ openclaw-box
 ==============================
  （1）清空当前会话上下文
  （2）清空所有人上下文
- （3）重启所有服务
- （4）停止所有服务
- （5）启动所有服务
- （6）查看日志
- （7）清空日志
- （8）切换模型
- （9）重置配置（重新输入 Token 和域名）
-（10）卸载（停止并移除 Docker 容器）
+ （3）按入口清空上下文（Web/Telegram/飞书）
+ （4）重启所有服务
+ （5）停止所有服务
+ （6）启动所有服务
+ （7）查看应用日志（openclaw_service）
+ （8）查看全部容器日志
+ （9）清空日志
+（10）切换模型
+ （11）管理图片存储
+ （12）重置配置（重新输入 Token 和域名）
+ （13）卸载（停止并移除 Docker 容器）
+ （14）微信 ClawBot（Beta）管理
  （0）退出
 ==============================
 ```
@@ -519,14 +594,18 @@ openclaw-box
 |------|----------|
 | 1 | 按 `chat_id` 清空指定会话上下文（只影响该会话） |
 | 2 | 清空所有用户/群聊会话上下文 |
-| 3 | 重启当前已部署的服务容器 |
-| 4 | 停止当前已部署的服务 |
-| 5 | 启动当前已部署的服务 |
-| 6 | 查看当前已部署容器最近 50 行日志 |
-| 7 | 清空当前已部署容器的日志文件 |
-| 8 | 切换 AI 模型（Copilot / DeepSeek），**切换后建议同时执行选项（2）清空所有人上下文** |
-| 9 | 备份并删除 `.env`，重新运行部署向导重新输入 Token、域名等配置 |
-| 10 | 停止并移除所有 OpenClaw Docker 容器，可选同时删除 `.env` |
+| 3 | 按入口清空上下文（Web / Telegram / 飞书） |
+| 4 | 重启当前已部署的服务容器 |
+| 5 | 停止当前已部署的服务 |
+| 6 | 启动当前已部署的服务 |
+| 7 | 查看当前已部署 `openclaw_service` 的应用日志 |
+| 8 | 查看全部容器日志 |
+| 9 | 清空当前已部署容器的日志文件 |
+| 10 | 切换 AI 模型（Copilot / DeepSeek），切换后建议同时执行选项（2）清空所有人上下文 |
+| 11 | 管理图片存储（删除全部图片 / 按文件名删除） |
+| 12 | 备份并删除 `.env`，重新运行部署向导重新输入 Token、域名等配置 |
+| 13 | 停止并移除所有 OpenClaw Docker 容器，可选同时删除 `.env` |
+| 14 | 微信 ClawBot（Beta）管理：查状态、重新扫码、看更新状态、执行 Beta 更新、移除通道、运行 doctor 修复、查看后端桥接状态 |
 
 ### 可用模型
 
