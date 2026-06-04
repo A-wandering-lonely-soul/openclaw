@@ -2344,11 +2344,21 @@ def is_time_query(text: str) -> bool:
     # 提醒/闹钟类请求应走工具调度，不走纯时间回答捷径。
     if re.search(r"提醒|闹钟|定时", text, re.IGNORECASE):
         return False
+    compact = re.sub(r"[\s\u3000，。,.!?！？：:；;、~～\-_/\\|@#]+", "", str(text)).lower()
     patterns = [
-        r"现在几点", r"现在几时", r"几点了", r"当前时间", r"现在时间", r"现在是几点",
-        r"今天几号", r"今天是几号", r"当前日期", r"今天星期几", r"今天周几", r"现在几号",
+        r"现在几点", r"现在几时", r"现在是几点", r"几点了", r"当前时间", r"现在时间",
+        r"今天几号", r"今天是几号", r"现在几号", r"当前日期", r"今天星期几", r"今天周几", r"今天礼拜几",
+        r"北京时间", r"当前是几月几号", r"今天多少号",
     ]
-    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+    if any(re.search(p, compact, re.IGNORECASE) for p in patterns):
+        return True
+
+    # 兜底：覆盖“帮我看下现在时间/麻烦说下今天日期”等口语句式。
+    if re.search(r"(现在|当前).{0,6}(时间|几点|几时|日期|几号)", compact, re.IGNORECASE):
+        return True
+    if re.search(r"(今天).{0,6}(几号|日期|星期几|周几|礼拜几)", compact, re.IGNORECASE):
+        return True
+    return False
 
 
 def build_time_reply() -> str:
@@ -2573,6 +2583,7 @@ def chat():
 
     # 时间/日期问答强制走服务器时间，避免模型受搜索结果或历史语境影响而答错时区。
     if (not images) and is_time_query(prompt):
+        logger.info("[TIME_FASTPATH] hit entry=%s prompt=%r", entry or "default", prompt)
         reply = build_time_reply()
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": reply})
