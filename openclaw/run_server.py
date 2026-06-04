@@ -576,6 +576,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "schedule_reminder_at",
+            "description": "创建一次性提醒，按指定时间触发（北京时间）。支持 12:30、12点、明天9点、2026-06-05 12:30 等格式。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "提醒任务唯一名称"},
+                    "run_at": {"type": "string", "description": "触发时间（北京时间），如 12:30、12点、明天9点、2026-06-05 12:30"},
+                    "message": {"type": "string", "description": "到点后要推送的提醒内容"},
+                    "description": {"type": "string", "description": "提醒说明（可选）", "default": ""},
+                    "notify_chat_id": {"type": "string", "description": "执行完毕后将提醒推送到此 Telegram chat_id，填入当前用户的 chat_id 即可。", "default": ""}
+                },
+                "required": ["name", "run_at", "message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_tasks",
             "description": "列出所有已创建的定时任务及其状态。",
             "parameters": {"type": "object", "properties": {}}
@@ -636,6 +654,7 @@ WECHAT_BRIDGE_ENTRY = "wechat_clawbot"
 WEB_FRONTEND_ALLOWED_TOOL_NAMES = {
     "schedule_task",
     "schedule_reminder",
+    "schedule_reminder_at",
     "list_tasks",
     "remove_task",
     "get_stock_price",
@@ -894,6 +913,130 @@ def tool_schedule_reminder(name: str, delay_minutes: float, message: str, descri
             f"  触发时间: {run_at.strftime('%Y-%m-%d %H:%M:%S')} ({APP_TIMEZONE_NAME})\n"
             f"  提醒内容: {message}"
         )
+        if notify_chat_id:
+            msg += "\n  到点后将主动推送到你的 Telegram"
+        return msg
+    except Exception as e:
+        return f"创建提醒失败: {e}"
+
+
+def _parse_reminder_run_at(run_at: str) -> tuple[datetime | None, str, str]:
+    raw = (run_at or "").strip()
+    if not raw:
+        return None, "run_at 不能为空", ""
+
+    now = datetime.now(APP_TIMEZONE)
+
+    def _build(dt_date, hour: int, minute: int, second: int = 0) -> tuple[datetime | None, str]:
+        if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+            return None, "时间格式错误：小时/分钟/秒超出范围"
+        return datetime(
+            dt_date.year,
+            dt_date.month,
+            dt_date.day,
+            hour,
+            minute,
+            second,
+            tzinfo=APP_TIMEZONE,
+        ), ""
+
+    normalized = raw.replace("T", " ").replace("/", "-")
+    m_full = re.fullmatch(r"(\d{4}-\d{1,2}-\d{1,2})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?", normalized)
+    if m_full:
+        try:
+            y, mo, d = [int(x) for x in m_full.group(1).split("-")]
+            hh = int(m_full.group(2))
+            mm = int(m_full.group(3))
+            ss = int(m_full.group(4) or "0")
+            target = datetime(y, mo, d, hh, mm, ss, tzinfo=APP_TIMEZONE)
+            return target, "", ""
+        except Exception:
+            return None, "时间格式错误：请使用 YYYY-MM-DD HH:MM 或 YYYY-MM-DD HH:MM:SS", ""
+
+    m_chinese = re.fullmatch(r"(今天|明天)?\s*(\d{1,2})\s*点\s*(半|\d{1,2}分?)?", raw)
+    if m_chinese:
+        day_word = m_chinese.group(1) or ""
+        hh = int(m_chinese.group(2))
+        minute_token = m_chinese.group(3) or ""
+        if minute_token == "半":
+            mm = 30
+        elif minute_token:
+            mm = int(minute_token.replace("分", ""))
+        else:
+            mm = 0
+        base_date = now.date()
+        if day_word == "明天":
+            base_date = base_date + timedelta(days=1)
+        target, err = _build(base_date, hh, mm)
+        if err:
+            return None, err, ""
+        if day_word == "今天" and target <= now:
+            target = target + timedelta(days=1)
+            return target, "", "检测到“今天”该时间已过，已自动顺延到明天同一时间。"
+        if day_word == "" and target <= now:
+            target = target + timedelta(days=1)
+            return target, "", "当前时间已过，已自动按次日同一时间创建提醒。"
+        return target, "", ""
+
+    m_short = re.fullmatch(r"(今天|明天)?\s*(\d{1,2})[:：](\d{1,2})(?::(\d{1,2}))?", raw)
+    if m_short:
+        day_word = m_short.group(1) or ""
+        hh = int(m_short.group(2))
+        mm = int(m_short.group(3))
+        ss = int(m_short.group(4) or "0")
+        base_date = now.date()
+        if day_word == "明天":
+            base_date = base_date + timedelta(days=1)
+        target, err = _build(base_date, hh, mm, ss)
+        if err:
+            return None, err, ""
+        if day_word == "今天" and target <= now:
+            target = target + timedelta(days=1)
+            return target, "", "检测到“今天”该时间已过，已自动顺延到明天同一时间。"
+        if day_word == "" and target <= now:
+            target = target + timedelta(days=1)
+            return target, "", "当前时间已过，已自动按次日同一时间创建提醒。"
+        return target, "", ""
+
+    return None, "不支持的时间格式。请使用 12:30、12点、明天9点、2026-06-05 12:30", ""
+
+
+def tool_schedule_reminder_at(name: str, run_at: str, message: str, description: str = "", notify_chat_id: str = "") -> str:
+    try:
+        if not str(message or "").strip():
+            return "创建提醒失败：message 不能为空"
+
+        target, parse_err, auto_note = _parse_reminder_run_at(run_at)
+        if target is None:
+            return f"创建提醒失败：{parse_err}"
+        now = datetime.now(APP_TIMEZONE)
+        if target <= now:
+            return "创建提醒失败：触发时间必须晚于当前时间"
+
+        _scheduler.add_job(
+            _run_reminder_message,
+            DateTrigger(run_date=target, timezone=APP_TIMEZONE),
+            id=name,
+            args=[message, notify_chat_id],
+            replace_existing=True,
+        )
+        tasks = _load_tasks()
+        tasks[name] = {
+            "type": "once",
+            "run_at": target.isoformat(),
+            "message": message,
+            "description": description,
+            "notify_chat_id": notify_chat_id,
+        }
+        _save_tasks(tasks)
+
+        msg = (
+            f"✅ 一次性提醒 [{name}] 已创建\n"
+            f"  触发时间: {target.strftime('%Y-%m-%d %H:%M:%S')} ({APP_TIMEZONE_NAME})\n"
+            f"  提醒内容: {message}"
+        )
+        if auto_note:
+            msg += f"\n  提示: {auto_note}"
         if notify_chat_id:
             msg += "\n  到点后将主动推送到你的 Telegram"
         return msg
@@ -1737,6 +1880,14 @@ def _reload_tooling_registry():
         ),
     )
     _register_tool(
+        "schedule_reminder_at",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "schedule_reminder_at"),
+        lambda args, _entry: tool_schedule_reminder_at(
+            args.get("name", ""), args.get("run_at", ""), args.get("message", ""),
+            args.get("description", ""), args.get("notify_chat_id", "")
+        ),
+    )
+    _register_tool(
         "list_tasks",
         next(t for t in TOOLS if t.get("function", {}).get("name") == "list_tasks"),
         lambda args, _entry: tool_list_tasks(),
@@ -2031,10 +2182,11 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
         )
     elif web_mode:
         principle_1 = "1. 用户说\"帮我做某事\"时，在能力范围内直接执行。"
-        execution_rule = "2. 网页入口模式下，可调用定时任务、一次性提醒与行情工具（schedule_task/schedule_reminder/list_tasks/remove_task/get_stock_price/get_gold_price）。"
+        execution_rule = "2. 网页入口模式下，可调用定时任务、一次性提醒与行情工具（schedule_task/schedule_reminder/schedule_reminder_at/list_tasks/remove_task/get_stock_price/get_gold_price）。"
         capability_lines = (
             "- schedule_task：创建 cron 定时任务（禁止特权命令，普通命令均可）\n"
             "- schedule_reminder：创建一次性提醒（例如‘5 分钟后提醒我…’）\n"
+            "- schedule_reminder_at：按具体时间创建一次性提醒（例如‘12点提醒我…’）\n"
             "- list_tasks：列出已有定时任务\n"
             "- remove_task：删除指定定时任务\n"
             "- get_stock_price：查询 A 股实时行情（支持代码或名称）\n"
@@ -2045,13 +2197,14 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "4. 定时命令禁止使用 sudo/systemctl/docker 等特权命令，普通 shell 命令均可。\n"
             "5. 网页入口无法收到推送通知，不要设置 notify_chat_id；如需在任务执行后收到通知，请通过 Telegram Bot 使用。\n"
             "6. 若用户说‘X 分钟后提醒我…’，必须优先使用 schedule_reminder 创建一次性提醒，不能转成周期 cron。\n"
-            "7. cron 只用于周期性任务；一次性提醒必须只触发一次。\n"
-            "8. 遇到错误要基于工具输出解释原因并给出可执行修正方案。\n"
-            "9. 任务完成后简洁告知用户任务名称、触发时间或 cron、下次执行时间（北京时间）。\n"
-            "10. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price，不要擅自改成定时任务。\n"
-            "11. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
-            "12. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "13. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "7. 若用户说‘12点/今晚8点/明早9点提醒我…’这类绝对时间，优先使用 schedule_reminder_at；不要口算时间差。\n"
+            "8. cron 只用于周期性任务；一次性提醒必须只触发一次。\n"
+            "9. 遇到错误要基于工具输出解释原因并给出可执行修正方案。\n"
+            "10. 任务完成后简洁告知用户任务名称、触发时间或 cron、下次执行时间（北京时间）。\n"
+            "11. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price，不要擅自改成定时任务。\n"
+            "12. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "13. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "14. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     else:
         principle_1 = "1. 用户说\"帮我做某事\"时，直接动手执行，不要只给文字建议。"
@@ -2063,6 +2216,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "- http_get：发起 HTTP GET 请求（查询公开 API、抓取数据）\n"
             "- schedule_task：创建 cron 定时任务（服务重启后自动恢复）\n"
             "- schedule_reminder：创建一次性提醒（例如‘5 分钟后提醒我…’）\n"
+            "- schedule_reminder_at：按具体时间创建一次性提醒（例如‘12点提醒我…’）\n"
             "- list_tasks：列出所有定时任务\n"
             "- remove_task：删除定时任务\n"
             "- get_stock_price：查询A股实时股价（支持股票代码或名称，如\"600519\"或\"贵州茅台\"）\n"
@@ -2074,14 +2228,15 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "4. 如果用户希望收到定时任务的执行结果，在调用 schedule_task 时将 notify_chat_id 设为 "
             f"{chat_id}，系统会自动通过 Telegram 主动推送结果给用户。\n"
             "5. 若用户说‘X 分钟后提醒我…’，必须优先使用 schedule_reminder 创建一次性提醒，不能转成周期 cron。\n"
-            "6. cron 只用于周期性任务；一次性提醒必须只触发一次。\n"
-            "7. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。\n"
-            "8. 任务完成后简洁告知用户结果和下次执行时间等关键信息。\n"
-            "9. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
-            "10. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。\n"
-            "11. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。\n"
-            "12. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "13. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "6. 若用户说‘12点/今晚8点/明早9点提醒我…’这类绝对时间，优先使用 schedule_reminder_at；不要口算时间差。\n"
+            "7. cron 只用于周期性任务；一次性提醒必须只触发一次。\n"
+            "8. 遇到错误要查看输出、分析原因并尝试修复，不要直接放弃。\n"
+            "9. 任务完成后简洁告知用户结果和下次执行时间等关键信息。\n"
+            "10. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
+            "11. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。\n"
+            "12. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。\n"
+            "13. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
+            "14. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
         )
     structured_output_spec = "" if not web_mode else """
 ## 结构化输出规范（Web 前端可视化）
