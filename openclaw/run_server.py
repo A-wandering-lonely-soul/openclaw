@@ -2338,6 +2338,28 @@ def is_weather_query(text: str) -> bool:
     return bool(re.search(r"天气|气温|温度|下雨|降雨|风力|空气质量|预报", text, re.IGNORECASE))
 
 
+def is_time_query(text: str) -> bool:
+    if not text:
+        return False
+    # 提醒/闹钟类请求应走工具调度，不走纯时间回答捷径。
+    if re.search(r"提醒|闹钟|定时", text, re.IGNORECASE):
+        return False
+    patterns = [
+        r"现在几点", r"现在几时", r"几点了", r"当前时间", r"现在时间", r"现在是几点",
+        r"今天几号", r"今天是几号", r"当前日期", r"今天星期几", r"今天周几", r"现在几号",
+    ]
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def build_time_reply() -> str:
+    now = datetime.now(APP_TIMEZONE)
+    weekday_map = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday = weekday_map[now.weekday()]
+    return (
+        f"现在是 {now.strftime('%Y年%m月%d日 %H:%M')}（北京时间，{weekday}）。"
+    )
+
+
 def resolve_weather_target_date(text: str):
     now = datetime.now(APP_TIMEZONE)
     offset = None
@@ -2548,6 +2570,14 @@ def chat():
 
     ollama_mode = runtime_provider == "ollama"
     images = data.get("images", [])
+
+    # 时间/日期问答强制走服务器时间，避免模型受搜索结果或历史语境影响而答错时区。
+    if (not images) and is_time_query(prompt):
+        reply = build_time_reply()
+        history.append({"role": "user", "content": prompt})
+        history.append({"role": "assistant", "content": reply})
+        persist_chat_delta(chat_id, entry, history[history_start_idx:], username=username, user_id=user_id, title=title)
+        return jsonify({"response": reply})
 
     # 联网搜索增强
     user_content = prompt
