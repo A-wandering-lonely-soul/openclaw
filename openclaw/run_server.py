@@ -594,6 +594,14 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_current_time",
+            "description": "获取服务器当前时间（北京时间）。用于‘现在几点/今天几号’等问题，避免模型口算时间。",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_tasks",
             "description": "列出所有已创建的定时任务及其状态。",
             "parameters": {"type": "object", "properties": {}}
@@ -652,6 +660,7 @@ BUILTIN_TOOL_NAMES = {
 WEB_FRONTEND_ENTRY = "web_frontend"
 WECHAT_BRIDGE_ENTRY = "wechat_clawbot"
 WEB_FRONTEND_ALLOWED_TOOL_NAMES = {
+    "get_current_time",
     "schedule_task",
     "schedule_reminder",
     "schedule_reminder_at",
@@ -1099,6 +1108,14 @@ def tool_list_tasks() -> str:
         if info.get("description"):
             lines.append(f"    说明: {info['description']}")
     return "\n".join(lines)
+
+
+def tool_get_current_time() -> str:
+    now = datetime.now(APP_TIMEZONE)
+    return (
+        f"当前服务器时间：{now.strftime('%Y-%m-%d %H:%M:%S')} ({APP_TIMEZONE_NAME})\n"
+        f"Unix 时间戳：{int(now.timestamp())}"
+    )
 
 
 def tool_remove_task(name: str) -> str:
@@ -1888,6 +1905,11 @@ def _reload_tooling_registry():
         ),
     )
     _register_tool(
+        "get_current_time",
+        next(t for t in TOOLS if t.get("function", {}).get("name") == "get_current_time"),
+        lambda args, _entry: tool_get_current_time(),
+    )
+    _register_tool(
         "list_tasks",
         next(t for t in TOOLS if t.get("function", {}).get("name") == "list_tasks"),
         lambda args, _entry: tool_list_tasks(),
@@ -2182,8 +2204,9 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
         )
     elif web_mode:
         principle_1 = "1. 用户说\"帮我做某事\"时，在能力范围内直接执行。"
-        execution_rule = "2. 网页入口模式下，可调用定时任务、一次性提醒与行情工具（schedule_task/schedule_reminder/schedule_reminder_at/list_tasks/remove_task/get_stock_price/get_gold_price）。"
+        execution_rule = "2. 网页入口模式下，可调用时间/提醒/行情工具（get_current_time/schedule_task/schedule_reminder/schedule_reminder_at/list_tasks/remove_task/get_stock_price/get_gold_price）。"
         capability_lines = (
+            "- get_current_time：获取服务器当前时间（北京时间）\n"
             "- schedule_task：创建 cron 定时任务（禁止特权命令，普通命令均可）\n"
             "- schedule_reminder：创建一次性提醒（例如‘5 分钟后提醒我…’）\n"
             "- schedule_reminder_at：按具体时间创建一次性提醒（例如‘12点提醒我…’）\n"
@@ -2204,7 +2227,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "11. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price，不要擅自改成定时任务。\n"
             "12. 不要编造或猜测自己的能力范围；上面列出的就是你全部能力。\n"
             "13. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "14. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "14. 当用户询问“现在几点/今天几号/当前日期”等时间问题时，必须先调用 get_current_time，再基于工具结果回答。"
         )
     else:
         principle_1 = "1. 用户说\"帮我做某事\"时，直接动手执行，不要只给文字建议。"
@@ -2214,6 +2237,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "- write_file：在工作区创建/覆盖文件\n"
             "- read_file：读取工作区文件内容\n"
             "- http_get：发起 HTTP GET 请求（查询公开 API、抓取数据）\n"
+            "- get_current_time：获取服务器当前时间（北京时间）\n"
             "- schedule_task：创建 cron 定时任务（服务重启后自动恢复）\n"
             "- schedule_reminder：创建一次性提醒（例如‘5 分钟后提醒我…’）\n"
             "- schedule_reminder_at：按具体时间创建一次性提醒（例如‘12点提醒我…’）\n"
@@ -2236,7 +2260,7 @@ def build_system_prompt(chat_id: str, entry: str = "") -> str:
             "11. 涉及价格/行情时，必须严格基于工具返回结果中的“数据日期/时间”表述；历史数据绝不能说成“今天”或“实时”。\n"
             "12. 当用户询问 A股/股票/黄金/金价 时，优先调用 get_stock_price 或 get_gold_price；不要仅根据搜索引擎摘要直接报价格。\n"
             "13. 所有定时任务时间一律按北京时间（Asia/Shanghai）解释与反馈。\n"
-            "14. 当用户询问“今天几号/当前日期”等时间问题时，优先基于上面的服务器时间回答，并明确日期。"
+            "14. 当用户询问“现在几点/今天几号/当前日期”等时间问题时，必须先调用 get_current_time，再基于工具结果回答。"
         )
     structured_output_spec = "" if not web_mode else """
 ## 结构化输出规范（Web 前端可视化）
@@ -2315,7 +2339,7 @@ def is_weather_query(text: str) -> bool:
 
 
 def resolve_weather_target_date(text: str):
-    now = datetime.now().astimezone()
+    now = datetime.now(APP_TIMEZONE)
     offset = None
     label = ""
 
@@ -2732,6 +2756,7 @@ def chat():
 @app.route("/api/channel/wechat/status", methods=["GET"])
 def wechat_bridge_status():
     runtime = get_runtime_config_for_entry(WECHAT_BRIDGE_ENTRY)
+    now = datetime.now(APP_TIMEZONE)
     return jsonify({
         "enabled": WECHAT_BRIDGE_ENABLED,
         "token_configured": bool(WECHAT_BRIDGE_TOKEN),
@@ -2739,6 +2764,8 @@ def wechat_bridge_status():
         "provider": runtime["provider"],
         "model": runtime["model"],
         "dedup_ttl_seconds": WECHAT_BRIDGE_DEDUP_TTL_SECONDS,
+        "server_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "server_timezone": APP_TIMEZONE_NAME,
     })
 
 
