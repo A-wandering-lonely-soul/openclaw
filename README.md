@@ -6,7 +6,7 @@
 **主要功能：**
 - 支持多模型切换（GitHub Copilot GPT-4.1 / gpt-4o 等、DeepSeek V3 / R1）
 - 自动联网搜索（Tavily），问到实时信息时自动查询
-- A股行情多通道查询（**Sina Finance 直连**优先，失败自动切换东方财富/AKShare 兜底；支持股票/指数/ETF）
+- A股行情多通道查询（**东方财富直连**优先，失败自动切换腾讯/Tushare 兜底；支持股票/指数/ETF）
 - 网页端自选股列表**按用户持久化至 PostgreSQL**，多设备/多浏览器保持一致
 - Skill 插件机制（第一版）：支持从本地目录加载 skill.json，动态扩展工具与系统提示
 - 聊天上下文采用 Redis（热缓存）+ PostgreSQL（持久化）
@@ -733,14 +733,25 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 **Q: 切换模型后 AI 还是用旧模型的人设回复**
 - 切换模型后必须同时清空上下文（管理面板选项 1），否则旧对话历史会影响新模型
 
+**Q: 微信独立模型怎么切换？能不能像 openclaw 官方那样直接命令切换？**
+- 当前仓库的微信桥接模型由 `.env` 中 `WECHAT_BRIDGE_PROVIDER` / `WECHAT_BRIDGE_MODEL` 控制，和官方 openclaw 通道自身模型配置是两套。
+- 在服务器执行以下命令即可切换微信独立模型（示例切到 DeepSeek Chat）：
+- `cd ~/openclaw`
+- `sed -i 's/^WECHAT_BRIDGE_PROVIDER=.*/WECHAT_BRIDGE_PROVIDER=deepseek/' .env`
+- `sed -i 's/^WECHAT_BRIDGE_MODEL=.*/WECHAT_BRIDGE_MODEL=deepseek-chat/' .env`
+- `docker compose up -d --force-recreate openclaw`
+- 可用 `curl -s http://127.0.0.1:8000/api/channel/wechat/status` 验证是否已生效。
+- 若你希望“发请求就热切换微信模型”，当前版本还不支持微信独立热切；只能改环境变量并重建容器。
+
 **Q: 联网搜索没有触发**
-- 检查 `TAVILY_API_KEY` 是否已填入 `.env` 并重新部署（`build --no-cache`）
+- 检查 `TAVILY_API_KEY` 是否已填入 `.env`，并执行 `docker compose up -d --force-recreate openclaw`
 - 消息里需含有触发关键词（最新、今天、天气、新闻等）
 
 **Q: A股查询失败或返回过旧数据**
-- 当前实现为三通道：优先 **Sina Finance 直连**（`hq.sinajs.cn`），失败自动切 `东方财富` -> `AKShare ETF 兜底`
+- 当前实现为三通道：优先 **东方财富直连**，失败自动切 `腾讯行情`，最后再用 `Tushare` 兜底
 - 建议使用 6 位代码（如 `000001`、`512660`），指数前缀规则：`000xxx`/`5/6xxxx` 对应上交所，`399xxx`/`0/1/2/3xxxx` 对应深交所
-- 若 Sina Finance 被屏蔽，可在容器内自检东方财富：`docker exec -i openclaw_service curl -s 'https://push2.eastmoney.com/api/qt/stock/get?secid=1.600519&fields=f43' | head -c 200`
+- 可在容器内自检东方财富：`docker exec -i openclaw_service curl -s 'https://push2.eastmoney.com/api/qt/stock/get?secid=1.600519&fields=f43' | head -c 200`
+- 可在容器内自检腾讯行情：`docker exec -i openclaw_service curl -s 'https://qt.gtimg.cn/q=sh600519' | head -c 200`
 - 若修改过 `run_server.py` 后未生效，执行：`docker compose restart openclaw`
 
 **Q: 运行 `openclaw-box` 报错 `Permission denied`**
@@ -752,7 +763,8 @@ curl https://$(grep DOMAIN .env | cut -d= -f2)/api/get_model
 - 修复命令：`sed -i 's/\r//' ~/openclaw/deploy.sh ~/openclaw/openclaw-box.sh`
 
 **Q: .env 修改后不生效**
-- 可以直接重新运行 `./deploy.sh`，或手动执行 `docker compose up -d`
+- 环境变量变更后需执行：`docker compose up -d --force-recreate openclaw`（`restart` 通常不会重新注入新环境变量）
+- 若改动较多，也可重新运行 `./deploy.sh` 后再执行上述 `--force-recreate`
 - 检查 .env 是否有 Windows 换行符：`cat -A .env`（行尾出现 `^M` 则有问题）
 - 修复命令：`sed -i 's/\r//' .env`
 
